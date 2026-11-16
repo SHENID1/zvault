@@ -1,0 +1,17 @@
+{
+  "host": "127.0.0.1",
+  "port": 8765,
+  "upstreams": {
+    "agentrouter": "https://agentrouter.org/v1",
+    "aegis": "https://aegis-ubuntu.tailcfa41a.ts.net/v1",
+    "bigmodel": "https://open.bigmodel.cn/api/paas/v4"
+  },
+  "allowed_hosts": [
+    "agentrouter.org",
+    "aegis-ubuntu.tailcfa41a.ts.net",
+    "open.bigmodel.cn",
+    "api.openai.com",
+    "api.anthropic.com"
+  ],
+  "secrets_file": "secrets.json"
+}
