@@ -15,8 +15,16 @@ def calculate_shannon_entropy(s: str) -> float:
     return -sum((count / length) * math.log2(count / length) for count in counts.values())
 
 
+# Non-sensitive environment variable names to ignore when loading .env
+IGNORE_ENV_KEYS = {
+    "NODE_ENV", "PORT", "HOST", "DEBUG", "LOG_LEVEL", "ENV", "ENVIRONMENT",
+    "PUBLIC_URL", "APP_ENV", "MODE", "BROWSER", "HTTPS", "TZ", "LANG", "CI",
+    "PATH", "SHELL", "USER", "HOME", "HOSTNAME"
+}
+
+
 class SecretVault:
-    def __init__(self, secrets_file: Optional[str] = None):
+    def __init__(self, secrets_file: Optional[str] = None, env_files: Optional[List[str]] = None):
         self.secrets_file = secrets_file
         self.secret_to_placeholder: Dict[str, str] = {}
         self.placeholder_to_secret: Dict[str, str] = {}
@@ -63,6 +71,43 @@ class SecretVault:
 
         if secrets_file and os.path.exists(secrets_file):
             self.load_secrets_file(secrets_file)
+
+        if env_files:
+            for ef in env_files:
+                if os.path.exists(ef):
+                    self.load_env_file(ef)
+
+    def load_env_file(self, path: str) -> int:
+        """Loads secrets from a .env file, ignoring non-sensitive config keys."""
+        loaded = 0
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if "=" in line:
+                        key, val = line.split("=", 1)
+                        key = key.strip()
+                        val = val.strip().strip("\"'").strip()
+
+                        # Skip non-sensitive keys
+                        if key.upper() in IGNORE_ENV_KEYS:
+                            continue
+                        # Skip booleans and nulls
+                        if val.lower() in ("true", "false", "null", "undefined", "yes", "no"):
+                            continue
+                        # Skip short port numbers or single digits
+                        if val.isdigit() and len(val) < 8:
+                            continue
+                        # Only mask meaningful values >= 5 chars
+                        if len(val) >= 5:
+                            self.register_secret(val, key)
+                            loaded += 1
+            print(f"[Vault] Loaded {loaded} secret(s) from .env file: {path}")
+        except Exception as e:
+            print(f"[Vault] Error loading .env from {path}: {e}")
+        return loaded
 
     def load_secrets_file(self, path: str):
         """Loads static secrets from a JSON or line-based text file."""

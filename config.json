@@ -13,5 +13,9 @@
     "api.openai.com",
     "api.anthropic.com"
   ],
-  "secrets_file": "secrets.json"
+  "secrets_file": "secrets.json",
+  "env_files": [
+    ".env",
+    "C:/Users/dines/WebstormProjects/Internsuka/.env"
+  ]
 }

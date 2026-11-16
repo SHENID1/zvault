@@ -98,5 +98,38 @@ class TestVaultMasking(unittest.TestCase):
         self.assertEqual(assembled_delta, f'API_KEY = "{real_key}"\nprint(API_KEY)')
 
 
+    def test_env_file_loading(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w+", delete=False, suffix=".env") as f:
+            f.write("""
+            # Comment line
+            PORT=8080
+            NODE_ENV=production
+            DEBUG=true
+            MY_CUSTOM_SECRET_API=superSecretVal12345
+            DATABASE_PASSWORD="anotherSecretPassword99"
+            """)
+            f.flush()
+            temp_path = f.name
+
+        vault_env = SecretVault(env_files=[temp_path])
+        self.assertIn("superSecretVal12345", vault_env.secret_to_placeholder)
+        self.assertIn("anotherSecretPassword99", vault_env.secret_to_placeholder)
+        # Verify non-sensitive were ignored
+        self.assertNotIn("8080", vault_env.secret_to_placeholder)
+        self.assertNotIn("production", vault_env.secret_to_placeholder)
+        self.assertNotIn("true", vault_env.secret_to_placeholder)
+
+        # Test masking with .env values
+        text = 'connect("superSecretVal12345")'
+        masked, _ = vault_env.mask_text(text)
+        self.assertIn("__VAULT_MY_CUSTOM_SECRET_API_", masked)
+        restored, _ = vault_env.demask_text(masked)
+        self.assertEqual(restored, text)
+
+        import os
+        os.unlink(temp_path)
+
+
 if __name__ == "__main__":
     unittest.main()
