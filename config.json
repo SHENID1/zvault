@@ -15,8 +15,7 @@
   ],
   "secrets_file": "secrets.json",
   "env_files": [
-    ".env",
-    "C:/Users/dines/WebstormProjects/Internsuka/.env"
+    ".env"
   ],
   "injection_guard": {
     "enabled": true,
