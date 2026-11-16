@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+*.pid
+out.txt
+err.txt
+*.log
+
