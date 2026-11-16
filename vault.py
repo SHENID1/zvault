@@ -1,7 +1,19 @@
 import re
 import json
 import os
-from typing import Dict, List, Tuple, Any, Optional
+import math
+from collections import Counter
+from typing import Dict, List, Tuple, Any, Optional, Callable
+
+
+def calculate_shannon_entropy(s: str) -> float:
+    """Calculates Shannon entropy for string s."""
+    if not s:
+        return 0.0
+    length = len(s)
+    counts = Counter(s)
+    return -sum((count / length) * math.log2(count / length) for count in counts.values())
+
 
 class SecretVault:
     def __init__(self, secrets_file: Optional[str] = None):
@@ -9,23 +21,45 @@ class SecretVault:
         self.secret_to_placeholder: Dict[str, str] = {}
         self.placeholder_to_secret: Dict[str, str] = {}
         self._next_id = 1
+        self.on_demask: Optional[Callable[[str, str], None]] = None
+        self.on_mask: Optional[Callable[[str, str], None]] = None
 
-        # Built-in regex patterns for common high-risk secrets
-        self.patterns = [
-            # OpenAI / Anthropic / general API keys
+        # Signatures for well-known API formats (more specific patterns first)
+        self.signature_patterns = [
+            # Anthropic specific AI keys
+            (r"\b(sk-ant-[a-zA-Z0-9_\-]{20,})\b", "ANTHROPIC_KEY"),
+            # OpenAI / General AI keys
             (r"\b(sk-[a-zA-Z0-9_\-]{20,})\b", "API_KEY"),
-            # GitHub Personal Access Tokens (classic & fine-grained)
+            # Google AI Studio / Maps / Cloud API Key
+            (r"\b(AIza[0-9A-Za-z\-_]{35})\b", "GOOGLE_API_KEY"),
+            # GitHub Personal Access Tokens
             (r"\b(ghp_[a-zA-Z0-9]{36})\b", "GITHUB_PAT"),
             (r"\b(github_pat_[a-zA-Z0-9_]{82})\b", "GITHUB_PAT"),
             # Telegram Bot Tokens
             (r"\b(\d{9,10}:[A-Za-z0-9_-]{35})\b", "TG_BOT_TOKEN"),
             # AWS Access Key ID
             (r"\b(AKIA[0-9A-Z]{16})\b", "AWS_KEY"),
+            # Slack Tokens
+            (r"\b(xox[baprs]-[0-9]{10,13}-[0-9]{10,13}[a-zA-Z0-9-]*)\b", "SLACK_TOKEN"),
+            # Stripe API Keys
+            (r"\b([rs]k_(?:live|test)_[0-9a-zA-Z]{24,})\b", "STRIPE_KEY"),
+            # JSON Web Tokens (JWT)
+            (r"\b(eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,})\b", "JWT_TOKEN"),
             # Private keys
             (r"(-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+ PRIVATE KEY-----)", "PRIVATE_KEY"),
-            # Database URIs with passwords (e.g., postgresql://user:password@host)
-            (r"(?:postgres|postgresql|mongodb|mysql|redis):\/\/[^:\/\s]+:([^@\/\s]+)@", "DB_PASSWORD"),
+            # Database URIs with passwords
+            (r"(?:postgres|postgresql|mongodb|mysql|redis):\/\/[^:\/\s]+:([^@\/\s]{4,})@", "DB_PASSWORD"),
         ]
+
+        # Contextual assignment patterns (e.g. DB_PASSWORD = "...", apiKey: "...", token = "...")
+        self.assignment_pattern = re.compile(
+            r"""(?i)\b([a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd|private[_-]?key)[a-zA-Z0-9_]*)\s*[:=]\s*["']([^"']{6,})["']"""
+        )
+
+        # Environment variable export pattern (e.g. export STRIPE_KEY=...)
+        self.env_pattern = re.compile(
+            r"""(?i)\bexport\s+([A-Z0-9_]+)\s*=\s*["']?([^"'\s]{8,})["']?"""
+        )
 
         if secrets_file and os.path.exists(secrets_file):
             self.load_secrets_file(secrets_file)
@@ -41,7 +75,6 @@ class SecretVault:
                 if content.startswith("{"):
                     data = json.loads(content)
                     for k, v in data.items():
-                        # If format is {"sk-123": "MY_LABEL"} or {"label": "sk-123"}
                         if isinstance(v, str) and (len(v) > len(k) or v.startswith("sk-") or v.startswith("ghp_")):
                             self.register_secret(v, k)
                         else:
@@ -63,7 +96,6 @@ class SecretVault:
             return self.secret_to_placeholder[secret]
 
         if label:
-            # Clean label to be uppercase alphanumeric
             clean_label = re.sub(r"[^A-Za-z0-9_]", "_", label).upper()
             placeholder = f"__VAULT_{clean_label}_{self._next_id:02d}__"
         else:
@@ -72,20 +104,62 @@ class SecretVault:
         self._next_id += 1
         self.secret_to_placeholder[secret] = placeholder
         self.placeholder_to_secret[placeholder] = secret
+
+        if self.on_mask:
+            self.on_mask(placeholder, secret)
+
         return placeholder
 
     def scan_and_register_dynamic(self, text: str) -> List[Tuple[str, str]]:
-        """Scans text for common secret patterns and registers newly found secrets."""
+        """
+        Smart Scanner:
+        1. Contextual assignments (e.g. token = "...", password: "...")
+        2. Known signatures (OpenAI, Anthropic, Google, AWS, GitHub, etc.)
+        3. Shannon Entropy analysis for high-randomness strings
+        """
         found = []
-        for pattern, label in self.patterns:
+
+        # 1. Contextual assignments in code or JSON
+        for m in self.assignment_pattern.finditer(text):
+            var_name = m.group(1)
+            val = m.group(2)
+            if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
+                ph = self.register_secret(val, var_name)
+                found.append((val, ph))
+
+        # 2. Environment exports
+        for m in self.env_pattern.finditer(text):
+            var_name = m.group(1)
+            val = m.group(2)
+            if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
+                ph = self.register_secret(val, var_name)
+                found.append((val, ph))
+
+        # 3. Signature patterns
+        for pattern, label in self.signature_patterns:
             matches = re.findall(pattern, text)
             for match in matches:
                 if isinstance(match, tuple):
                     match = match[0]
-                if match and len(match) >= 8:
+                if match and len(match) >= 8 and not match.startswith("__VAULT_"):
                     if match not in self.secret_to_placeholder:
-                        placeholder = self.register_secret(match, label)
-                        found.append((match, placeholder))
+                        ph = self.register_secret(match, label)
+                        found.append((match, ph))
+
+        # 4. Shannon Entropy analysis for arbitrary high-entropy tokens (>=20 chars)
+        potential_tokens = re.findall(r"\b[A-Za-z0-9_\-\.]{20,}\b", text)
+        for token in potential_tokens:
+            if token in self.secret_to_placeholder or token.startswith("__VAULT_"):
+                continue
+            # Must contain both letters and digits
+            if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
+                # Ignore URLs, typical paths or package names
+                if not token.startswith("http") and not "/" in token:
+                    h = calculate_shannon_entropy(token)
+                    if h >= 4.15:
+                        ph = self.register_secret(token, "ENTROPY_KEY")
+                        found.append((token, ph))
+
         return found
 
     def mask_text(self, text: str) -> Tuple[str, int]:
@@ -93,13 +167,12 @@ class SecretVault:
         if not text:
             return text, 0
 
-        # 1. Scan for newly appearing secrets
         self.scan_and_register_dynamic(text)
 
         replacements = 0
         masked = text
 
-        # Sort secrets by length descending to replace longest first (avoids sub-token collision)
+        # Sort secrets by length descending to avoid partial prefix collisions
         sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
         for secret in sorted_secrets:
             if secret in masked:
@@ -140,7 +213,6 @@ class SecretVault:
 
         restorations = 0
         result = text
-        # Sort placeholders by length descending
         sorted_placeholders = sorted(self.placeholder_to_secret.keys(), key=len, reverse=True)
         for placeholder in sorted_placeholders:
             if placeholder in result:
@@ -149,18 +221,20 @@ class SecretVault:
                 if count > 0:
                     result = result.replace(placeholder, real_secret)
                     restorations += count
+                    if self.on_demask:
+                        self.on_demask(placeholder, real_secret)
 
         return result, restorations
 
 
 class TextStreamDemasker:
     """
-    Stateful buffer for continuous text stream (e.g. content field inside SSE).
-    Buffers partial placeholders across token boundaries.
+    Stateful buffer for continuous text stream (e.g. delta field inside SSE).
+    Buffers only when an unclosed '__' placeholder prefix is detected at the tail.
     """
-    def __init__(self, vault: SecretVault, buffer_size: int = 40):
+    def __init__(self, vault: SecretVault, max_placeholder_len: int = 40):
         self.vault = vault
-        self.buffer_size = buffer_size
+        self.max_placeholder_len = max_placeholder_len
         self.buffer = ""
 
     def process(self, text: str) -> str:
@@ -168,27 +242,33 @@ class TextStreamDemasker:
             return ""
 
         self.buffer += text
-        # Demask any completed placeholders
+
+        # Demask any complete placeholders currently in buffer
         self.buffer, _ = self.vault.demask_text(self.buffer)
 
-        # Check if the buffer ends with an unclosed placeholder start
+        # Look for the last '__' in the buffer
         last_double_underscore = self.buffer.rfind("__")
-        if last_double_underscore != -1:
-            tail = self.buffer[last_double_underscore:]
-            # If tail starts with '__' and doesn't contain a closing '__' (after the first 2 chars)
-            if tail.startswith("__") and tail[2:].find("__") == -1 and len(tail) < self.buffer_size:
-                to_emit = self.buffer[:last_double_underscore]
-                self.buffer = tail
-                return to_emit
 
-        # If buffer is getting too long and doesn't match an unclosed placeholder
-        if len(self.buffer) > self.buffer_size:
-            cut = len(self.buffer) - self.buffer_size
-            to_emit = self.buffer[:cut]
-            self.buffer = self.buffer[cut:]
+        if last_double_underscore == -1:
+            # No '__' at all: entire buffer is safe to emit immediately
+            to_emit = self.buffer
+            self.buffer = ""
             return to_emit
 
-        return ""
+        # There is a '__'
+        tail = self.buffer[last_double_underscore:]
+
+        # If tail starts with '__' and doesn't contain a closing '__' (after the first 2 chars)
+        # and tail length is less than max_placeholder_len, hold tail back
+        if tail.startswith("__") and tail[2:].find("__") == -1 and len(tail) < self.max_placeholder_len:
+            to_emit = self.buffer[:last_double_underscore]
+            self.buffer = tail
+            return to_emit
+
+        # Otherwise, whatever is in buffer is either closed or too long to be a placeholder
+        to_emit = self.buffer
+        self.buffer = ""
+        return to_emit
 
     def flush(self) -> str:
         final_text, _ = self.vault.demask_text(self.buffer)
@@ -198,21 +278,24 @@ class TextStreamDemasker:
 
 class SSEStreamDemasker:
     """
-    Demasker specifically for Server-Sent Events (SSE).
-    Parses 'data: {...}' lines, demasks content inside delta/choices,
-    and handles placeholders split across multiple SSE events.
+    Universal Demasker for Server-Sent Events (SSE).
+    Supports:
+    1. OpenAI Realtime / Responses API (`openai-responses` format: `type: response.output_text.delta`, `delta: str`)
+    2. OpenAI Chat Completions (`choices[].delta.content`)
+    3. Anthropic (`type: content_block_delta`, `delta.text`)
+    4. Arbitrary JSON text fields and fallback raw SSE streams
     """
     def __init__(self, vault: SecretVault):
         self.vault = vault
         self.raw_line_buffer = ""
         self.content_demasker = TextStreamDemasker(vault)
-        self.reasoning_demasker = TextStreamDemasker(vault)
+        self.last_responses_event: Optional[Dict[str, Any]] = None
+        self.saw_choices: bool = False
 
     def process_raw_chunk(self, chunk: str) -> str:
         self.raw_line_buffer += chunk
         output = []
 
-        # Split into complete SSE events separated by \n\n or \n
         while "\n" in self.raw_line_buffer:
             line, self.raw_line_buffer = self.raw_line_buffer.split("\n", 1)
             line = line.strip()
@@ -223,22 +306,18 @@ class SSEStreamDemasker:
 
             if line.startswith("data:"):
                 data_str = line[5:].strip()
+
                 if data_str == "[DONE]":
-                    # Flush any buffered text before emitting [DONE]
-                    flushed_content = self.content_demasker.flush()
-                    flushed_reasoning = self.reasoning_demasker.flush()
-                    if flushed_content or flushed_reasoning:
-                        synthetic_chunk = {
-                            "choices": [{
-                                "index": 0,
-                                "delta": {}
-                            }]
-                        }
-                        if flushed_content:
-                            synthetic_chunk["choices"][0]["delta"]["content"] = flushed_content
-                        if flushed_reasoning:
-                            synthetic_chunk["choices"][0]["delta"]["reasoning_content"] = flushed_reasoning
-                        output.append(f"data: {json.dumps(synthetic_chunk)}\n\n")
+                    # Flush before [DONE]
+                    flushed = self.content_demasker.flush()
+                    if flushed:
+                        if self.last_responses_event:
+                            ev = dict(self.last_responses_event)
+                            ev["delta"] = flushed
+                            output.append(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+                        elif self.saw_choices:
+                            synth = {"choices": [{"index": 0, "delta": {"content": flushed}}]}
+                            output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
                     output.append("data: [DONE]\n\n")
                     continue
 
@@ -246,8 +325,16 @@ class SSEStreamDemasker:
                     event_data = json.loads(data_str)
                     modified = False
 
-                    # Check choices -> delta (OpenAI format)
-                    if isinstance(event_data, dict) and "choices" in event_data:
+                    # 1. Format: OpenAI Responses API (e.g. response.output_text.delta)
+                    # Used by ZCode when api.type == "openai-responses"!
+                    if isinstance(event_data, dict) and "delta" in event_data and isinstance(event_data["delta"], str):
+                        event_data["delta"] = self.content_demasker.process(event_data["delta"])
+                        self.last_responses_event = dict(event_data)
+                        modified = True
+
+                    # 2. Format: OpenAI Chat Completions (choices -> delta -> content)
+                    elif isinstance(event_data, dict) and "choices" in event_data and isinstance(event_data["choices"], list):
+                        self.saw_choices = True
                         for choice in event_data.get("choices", []):
                             delta = choice.get("delta", {})
                             if isinstance(delta, dict):
@@ -255,20 +342,33 @@ class SSEStreamDemasker:
                                     delta["content"] = self.content_demasker.process(delta["content"])
                                     modified = True
                                 if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
-                                    delta["reasoning_content"] = self.reasoning_demasker.process(delta["reasoning_content"])
+                                    delta["reasoning_content"] = self.content_demasker.process(delta["reasoning_content"])
                                     modified = True
 
-                    # Fallback for other formats (e.g. text/responses)
-                    if not modified and isinstance(event_data, dict):
-                        for key in ("text", "response", "content"):
-                            if key in event_data and isinstance(event_data[key], str):
-                                event_data[key] = self.content_demasker.process(event_data[key])
-                                modified = True
+                    # 3. Format: Anthropic (delta.text or content_block)
+                    elif isinstance(event_data, dict) and "delta" in event_data and isinstance(event_data["delta"], dict):
+                        if "text" in event_data["delta"] and isinstance(event_data["delta"]["text"], str):
+                            event_data["delta"]["text"] = self.content_demasker.process(event_data["delta"]["text"])
+                            modified = True
 
-                    output.append(f"data: {json.dumps(event_data)}\n")
+                    # 4. Universal fallback: recursive string demasking for any other JSON structure
+                    if not modified and isinstance(event_data, (dict, list)):
+                        def recursive_demask(item):
+                            if isinstance(item, str):
+                                res, _ = self.vault.demask_text(item)
+                                return res
+                            elif isinstance(item, list):
+                                return [recursive_demask(x) for x in item]
+                            elif isinstance(item, dict):
+                                return {k: recursive_demask(v) for k, v in item.items()}
+                            return item
+
+                        event_data = recursive_demask(event_data)
+
+                    output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n")
 
                 except Exception:
-                    # Non-JSON data payload, fallback to direct text demasking
+                    # Non-JSON data line: fallback direct text demask
                     demasked_line, _ = self.vault.demask_text(line)
                     output.append(demasked_line + "\n")
             else:
@@ -280,21 +380,15 @@ class SSEStreamDemasker:
 
     def flush(self) -> str:
         output = []
-        flushed_content = self.content_demasker.flush()
-        flushed_reasoning = self.reasoning_demasker.flush()
-
-        if flushed_content or flushed_reasoning:
-            synthetic_chunk = {
-                "choices": [{
-                    "index": 0,
-                    "delta": {}
-                }]
-            }
-            if flushed_content:
-                synthetic_chunk["choices"][0]["delta"]["content"] = flushed_content
-            if flushed_reasoning:
-                synthetic_chunk["choices"][0]["delta"]["reasoning_content"] = flushed_reasoning
-            output.append(f"data: {json.dumps(synthetic_chunk)}\n\n")
+        flushed = self.content_demasker.flush()
+        if flushed:
+            if self.last_responses_event:
+                ev = dict(self.last_responses_event)
+                ev["delta"] = flushed
+                output.append(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
+            elif self.saw_choices:
+                synth = {"choices": [{"index": 0, "delta": {"content": flushed}}]}
+                output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
 
         if self.raw_line_buffer:
             demasked_rem, _ = self.vault.demask_text(self.raw_line_buffer)
@@ -302,4 +396,3 @@ class SSEStreamDemasker:
             self.raw_line_buffer = ""
 
         return "".join(output)
-

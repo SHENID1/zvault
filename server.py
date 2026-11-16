@@ -44,6 +44,7 @@ if os.path.exists(CONFIG_FILE):
 # Initialize Vault
 secrets_path = os.path.join(os.path.dirname(__file__), config.get("secrets_file", "secrets.json"))
 vault = SecretVault(secrets_path)
+vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
 app = FastAPI(title="ZCode Secret Masking Proxy", version="1.0.0")
 

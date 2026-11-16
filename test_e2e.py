@@ -10,6 +10,32 @@ import pytest
 mock_app = FastAPI()
 received_payloads = []
 
+@mock_app.post("/v1/responses")
+async def mock_responses(request: Request):
+    body = await request.json()
+    received_payloads.append(body)
+
+    # In ZCode openai-responses, user message is in input or messages
+    text = str(body)
+    reply_text = f'API_KEY = "{body["input"] if "input" in body else body["messages"][-1]["content"]}"'
+
+    async def event_generator():
+        # Stream response.output_text.delta events (ZCode protocol)
+        half = len(reply_text) // 2
+        p1 = reply_text[:half]
+        p2 = reply_text[half:]
+
+        e1 = {"type": "response.output_text.delta", "item_id": "i1", "output_index": 0, "content_index": 0, "delta": p1}
+        yield f"data: {json.dumps(e1)}\n\n".encode("utf-8")
+
+        e2 = {"type": "response.output_text.delta", "item_id": "i1", "output_index": 0, "content_index": 0, "delta": p2}
+        yield f"data: {json.dumps(e2)}\n\n".encode("utf-8")
+
+        yield b"data: [DONE]\n\n"
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
 @mock_app.post("/v1/chat/completions")
 async def mock_chat(request: Request):
     body = await request.json()
@@ -109,7 +135,7 @@ async def run_e2e_tests():
             assert secret_token in reply_content, "Secret was not restored in non-streaming response!"
             print(f"✓ [PASS] Secret restoration confirmed in non-streaming response: '{reply_content}'")
 
-            # 3. Test Streaming request
+            # 3. Test Streaming request (chat/completions)
             payload_stream = {
                 "model": "gpt-4o",
                 "stream": True,
@@ -134,6 +160,22 @@ async def run_e2e_tests():
 
             assert secret_token in client_received_stream_content, "Secret was not restored in streaming SSE response!"
             print(f"✓ [PASS] Secret restoration confirmed in streaming SSE response: '{client_received_stream_content}'")
+
+            # 3b. Test ZCode /v1/responses format (openai-responses protocol)
+            resp_responses = await client.post("/mock/responses", json=payload_stream)
+            assert resp_responses.status_code == 200
+            responses_body = resp_responses.text
+
+            zcode_received_delta = ""
+            for line in responses_body.splitlines():
+                line = line.strip()
+                if line.startswith("data:") and line != "data: [DONE]":
+                    data = json.loads(line[5:].strip())
+                    if "delta" in data and isinstance(data["delta"], str):
+                        zcode_received_delta += data["delta"]
+
+            assert secret_token in zcode_received_delta, "Secret was not restored in ZCode responses stream!"
+            print(f"✓ [PASS] ZCode /v1/responses stream restoration confirmed: '{zcode_received_delta}'")
 
             # 4. Test Domain Binding (Blocking unallowed hosts)
             r_blocked = await client.post("/proxy/https/evil-attacker.com/v1/chat/completions", json=payload)
