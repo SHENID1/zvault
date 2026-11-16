@@ -24,6 +24,7 @@ import httpx
 import uvicorn
 
 from vault import SecretVault, SSEStreamDemasker
+from injection_guard import PromptInjectionGuard, InjectionResult
 
 # ANSI Colors for terminal output
 CYAN = "\033[96m"
@@ -53,11 +54,14 @@ if os.path.exists(CONFIG_FILE):
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         config.update(json.load(f))
 
-# Initialize Vault
+# Initialize Vault & Injection Guard
 secrets_path = os.path.join(os.path.dirname(__file__), config.get("secrets_file", "secrets.json"))
 env_files = config.get("env_files", [".env"])
 vault = SecretVault(secrets_path, env_files=env_files)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
+
+injection_cfg = config.get("injection_guard", {"enabled": True, "action": "warn", "sensitivity": 0.65})
+injection_guard = PromptInjectionGuard(sensitivity=float(injection_cfg.get("sensitivity", 0.65)))
 
 app = FastAPI(title="ZCode Secret Masking Proxy", version="1.0.0")
 
@@ -129,6 +133,19 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
     if raw_body:
         try:
             body_json = json.loads(raw_body.decode("utf-8"))
+
+            # Scan for prompt injections & jailbreaks
+            if injection_cfg.get("enabled", True):
+                msgs = body_json.get("messages", body_json.get("input", []))
+                inj_res = injection_guard.scan_messages(msgs)
+                if inj_res.is_malicious:
+                    action = injection_cfg.get("action", "warn").lower()
+                    if action == "block":
+                        log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
+                        raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
+                    else:
+                        log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
+
             masked_json, count = vault.mask_payload(body_json)
             if count > 0:
                 log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
@@ -327,12 +344,15 @@ async def add_env_endpoint(request: Request):
 async def test_echo(request: Request):
     """
     Offline safe test endpoint.
-    Demonstrates what an untrusted API would see vs what ZCode receives back.
-    No external requests are sent!
+    Demonstrates what an untrusted API would see vs what ZCode receives back,
+    plus prompt injection detection analysis.
     """
     raw_body = await request.body()
     try:
         body_json = json.loads(raw_body.decode("utf-8"))
+        msgs = body_json.get("messages", body_json.get("input", []))
+        inj_res = injection_guard.scan_messages(msgs)
+
         masked_json, mask_count = vault.mask_payload(body_json)
         simulated_api_view = json.dumps(masked_json, ensure_ascii=False)
         demasked_view, demask_count = vault.demask_text(simulated_api_view)
@@ -340,6 +360,13 @@ async def test_echo(request: Request):
         return {
             "status": "success",
             "secrets_detected": mask_count,
+            "prompt_injection_guard": {
+                "is_malicious": inj_res.is_malicious,
+                "risk_score": inj_res.risk_score,
+                "category": inj_res.category,
+                "matched_patterns": inj_res.matched_patterns,
+                "has_obfuscation": inj_res.has_obfuscation
+            },
             "1_what_untrusted_api_sees": masked_json,
             "2_what_zcode_receives_back": json.loads(demasked_view)
         }
