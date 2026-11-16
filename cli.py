@@ -74,9 +74,16 @@ def cmd_start(args):
         print(f"Starting {CYAN}{BOLD}ZVault{RESET} on {GREEN}{BASE_URL}{RESET}...", end=" ", flush=True)
 
         if sys.platform == "win32":
-            # Using cmd.exe 'start /min' to launch independent detached Windows process
-            cmd = f'cmd.exe /c start "ZVault" /min "{python_exe}" "{SERVER_PY}"'
-            subprocess.run(cmd, shell=True)
+            # CREATE_NEW_CONSOLE (0x00000010) starts a detached, independent Windows process
+            creationflags = 0x00000010
+            proc = subprocess.Popen(
+                [python_exe, SERVER_PY],
+                cwd=PROXY_DIR,
+                creationflags=creationflags
+            )
+            bg_pid = str(proc.pid)
+            with open(PID_FILE, "w") as f:
+                f.write(bg_pid)
         else:
             proc = subprocess.Popen(
                 [python_exe, SERVER_PY],
@@ -97,7 +104,8 @@ def cmd_start(args):
                 break
 
         if started:
-            pid_label = f" (PID: {bg_pid})" if bg_pid else ""
+            pid = get_pid()
+            pid_label = f" (PID: {pid})" if pid else ""
             print(f"{GREEN}{BOLD}✓ OK{RESET}{pid_label}")
             print(f"Logs: {CYAN}{LOG_FILE}{RESET}")
         else:

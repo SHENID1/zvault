@@ -149,13 +149,41 @@ class TestVaultMasking(unittest.TestCase):
         self.assertIn("home_net", ph3_collide)
 
         # Test masking and demasking
-        text = "SSH to 50.50.50.50 from 192.168.1.100"
+        text = "SSH to 50.50.50.50 from network 192.168.1"
         masked, count = self.vault.mask_text(text)
         self.assertIn("__host_1__", masked)
         self.assertIn("__home_net__", masked)
 
         restored, demask_count = self.vault.demask_text(masked)
         self.assertEqual(restored, text)
+
+
+    def test_ip_and_ssh_masking(self):
+        sample = """
+        Connecting to server 185.105.111.163 via router 192.168.31.1.
+        Subnet is 10.0.0.0/24.
+        Localhost is 127.0.0.1:8765 (should remain exempt).
+        SSH key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExamplePublicKeyStringHere1234567890 dinesh@pc
+        """
+        masked, count = self.vault.mask_text(sample)
+        # 185.105.111.163 should be masked
+        self.assertNotIn("185.105.111.163", masked)
+        self.assertIn("__VAULT_IP_ADDR_", masked)
+
+        # 192.168.31.1 should be masked as LOCAL_IP
+        self.assertNotIn("192.168.31.1", masked)
+        self.assertIn("__VAULT_LOCAL_IP_", masked)
+
+        # SSH public key should be masked
+        self.assertNotIn("AAAAC3NzaC1lZDI1NTE5AAAAIExamplePublicKeyStringHere1234567890", masked)
+        self.assertIn("__VAULT_SSH_PUB_KEY_", masked)
+
+        # 127.0.0.1 must be untouched!
+        self.assertIn("127.0.0.1:8765", masked)
+
+        # Demask
+        restored, demask_count = self.vault.demask_text(masked)
+        self.assertEqual(restored, sample)
 
 
 if __name__ == "__main__":

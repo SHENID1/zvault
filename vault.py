@@ -34,6 +34,12 @@ class SecretVault:
 
         # Signatures for well-known API formats (more specific patterns first)
         self.signature_patterns = [
+            # SSH Private Keys (OpenSSH, RSA, DSA, EC, ED25519)
+            (r"(-----BEGIN (?:OPENSSH|RSA|DSA|EC|ECDSA|ED25519) PRIVATE KEY-----[\s\S]+?-----END (?:OPENSSH|RSA|DSA|EC|ECDSA|ED25519) PRIVATE KEY-----)", "SSH_PRIV_KEY"),
+            # General Private Keys
+            (r"(-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+ PRIVATE KEY-----)", "PRIVATE_KEY"),
+            # SSH Public Keys (ssh-rsa, ssh-ed25519, ecdsa-sha2-*)
+            (r"\b((?:ssh-(?:rsa|ed25519|dss)|ecdsa-sha2-[a-z0-9\-]+)\s+[A-Za-z0-9+/]{30,}[=]{0,3}(?:\s+[\w\.\@\-]+)?)\b", "SSH_PUB_KEY"),
             # Anthropic specific AI keys
             (r"\b(sk-ant-[a-zA-Z0-9_\-]{20,})\b", "ANTHROPIC_KEY"),
             # OpenAI / General AI keys
@@ -53,11 +59,20 @@ class SecretVault:
             (r"\b([rs]k_(?:live|test)_[0-9a-zA-Z]{24,})\b", "STRIPE_KEY"),
             # JSON Web Tokens (JWT)
             (r"\b(eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,})\b", "JWT_TOKEN"),
-            # Private keys
-            (r"(-----BEGIN [A-Z ]+ PRIVATE KEY-----[\s\S]+?-----END [A-Z ]+ PRIVATE KEY-----)", "PRIVATE_KEY"),
             # Database URIs with passwords
             (r"(?:postgres|postgresql|mongodb|mysql|redis):\/\/[^:\/\s]+:([^@\/\s]{4,})@", "DB_PASSWORD"),
         ]
+
+        # IPv4 pattern (with optional CIDR prefix e.g. /24)
+        self.ipv4_pattern = re.compile(
+            r"\b((?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\/\d{1,2})?)\b"
+        )
+        self.ipv4_exempt = {"127.0.0.1", "0.0.0.0", "255.255.255.255", "1.1.1.1", "8.8.8.8", "8.8.4.4"}
+
+        # IPv6 pattern
+        self.ipv6_pattern = re.compile(
+            r"\b((?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4})\b"
+        )
 
         # Contextual assignment patterns (e.g. DB_PASSWORD = "...", apiKey: "...", token = "...")
         self.assignment_pattern = re.compile(
@@ -217,6 +232,32 @@ class SecretVault:
                     if h >= 4.15:
                         ph = self.register_secret(token, "ENTROPY_KEY")
                         found.append((token, ph))
+
+        # 5. IPv4 Addresses (Local & Public)
+        for m in self.ipv4_pattern.finditer(text):
+            ip = m.group(1)
+            if ip in self.ipv4_exempt or ip in self.secret_to_placeholder or ip.startswith("__VAULT_"):
+                continue
+            # Ignore if part of a version string like v1.2.3.4
+            start_pos = m.start()
+            if start_pos > 0 and text[start_pos - 1] in ("v", "V", "/"):
+                continue
+
+            # Classify local subnet vs public IP
+            clean_ip = ip.split("/")[0]
+            if clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", clean_ip):
+                ph = self.register_secret(ip, "LOCAL_IP")
+            else:
+                ph = self.register_secret(ip, "IP_ADDR")
+            found.append((ip, ph))
+
+        # 6. IPv6 Addresses
+        for m in self.ipv6_pattern.finditer(text):
+            ip6 = m.group(1)
+            if ip6 in ("::1", "::") or ip6 in self.secret_to_placeholder or ip6.startswith("__VAULT_"):
+                continue
+            ph = self.register_secret(ip6, "IPV6_ADDR")
+            found.append((ip6, ph))
 
         return found
 
