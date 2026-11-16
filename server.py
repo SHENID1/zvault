@@ -238,6 +238,30 @@ async def vault_status():
     }
 
 
+@app.post("/test-echo")
+async def test_echo(request: Request):
+    """
+    Offline safe test endpoint.
+    Demonstrates what an untrusted API would see vs what ZCode receives back.
+    No external requests are sent!
+    """
+    raw_body = await request.body()
+    try:
+        body_json = json.loads(raw_body.decode("utf-8"))
+        masked_json, mask_count = vault.mask_payload(body_json)
+        simulated_api_view = json.dumps(masked_json, ensure_ascii=False)
+        demasked_view, demask_count = vault.demask_text(simulated_api_view)
+
+        return {
+            "status": "success",
+            "secrets_detected": mask_count,
+            "1_what_untrusted_api_sees": masked_json,
+            "2_what_zcode_receives_back": json.loads(demasked_view)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # Universal proxy route: /proxy/https/agentrouter.org/v1/chat/completions
 @app.api_route("/proxy/{scheme}/{subpath:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def universal_proxy(scheme: str, subpath: str, request: Request):
