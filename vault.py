@@ -133,18 +133,31 @@ class SecretVault:
             print(f"[Vault] Error loading secrets from {path}: {e}")
 
     def register_secret(self, secret: str, label: Optional[str] = None) -> str:
-        """Registers a secret and returns its placeholder."""
-        if not secret or len(secret) < 6:
+        """
+        Registers a secret and returns its placeholder.
+        Supports exact custom placeholders (e.g. '__home_net__') or generates '__VAULT_{LABEL}_{ID}__'.
+        """
+        if not secret or len(secret) < 3:
             return secret
 
         if secret in self.secret_to_placeholder:
             return self.secret_to_placeholder[secret]
 
         if label:
-            clean_label = re.sub(r"[^A-Za-z0-9_]", "_", label).upper()
-            placeholder = f"__VAULT_{clean_label}_{self._next_id:02d}__"
+            # If user explicitly passed an exact placeholder format like '__home_net__'
+            if label.startswith("__") and label.endswith("__") and len(label) > 4:
+                clean_tag = re.sub(r"[^A-Za-z0-9_]", "_", label[2:-2])
+                placeholder = f"__{clean_tag}__"
+            else:
+                clean_label = re.sub(r"[^A-Za-z0-9_]", "_", label).upper()
+                placeholder = f"__VAULT_{clean_label}_{self._next_id:02d}__"
         else:
             placeholder = f"__VAULT_SECRET_{self._next_id:02d}__"
+
+        # If placeholder name collides with an existing one for a DIFFERENT secret
+        if placeholder in self.placeholder_to_secret:
+            clean_base = placeholder.strip("_")
+            placeholder = f"__{clean_base}_{self._next_id:02d}__"
 
         self._next_id += 1
         self.secret_to_placeholder[secret] = placeholder

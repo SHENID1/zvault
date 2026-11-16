@@ -131,5 +131,32 @@ class TestVaultMasking(unittest.TestCase):
         os.unlink(temp_path)
 
 
+    def test_custom_exact_placeholder(self):
+        # As suggested by Kostya: exact placeholders like __home_net__
+        ph1 = self.vault.register_secret("192.168.1", "__home_net__")
+        self.assertEqual(ph1, "__home_net__")
+
+        ph2 = self.vault.register_secret("50.50.50.50", "__host_1__")
+        self.assertEqual(ph2, "__host_1__")
+
+        # Test deduplication
+        ph1_dup = self.vault.register_secret("192.168.1", "__different__")
+        self.assertEqual(ph1_dup, "__home_net__")
+
+        # Test collision handling (different secret, same exact placeholder)
+        ph3_collide = self.vault.register_secret("10.0.0.1", "__home_net__")
+        self.assertNotEqual(ph3_collide, "__home_net__")
+        self.assertIn("home_net", ph3_collide)
+
+        # Test masking and demasking
+        text = "SSH to 50.50.50.50 from 192.168.1.100"
+        masked, count = self.vault.mask_text(text)
+        self.assertIn("__host_1__", masked)
+        self.assertIn("__home_net__", masked)
+
+        restored, demask_count = self.vault.demask_text(masked)
+        self.assertEqual(restored, text)
+
+
 if __name__ == "__main__":
     unittest.main()
