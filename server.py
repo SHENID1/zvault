@@ -5,6 +5,18 @@ import sys
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
 
+# Ensure sys.stdout and sys.stderr are valid when running in background under pythonw
+if sys.stdout is None:
+    try:
+        sys.stdout = open(os.path.join(os.path.dirname(__file__), "proxy.log"), "a", encoding="utf-8")
+    except Exception:
+        sys.stdout = open(os.devnull, "w")
+if sys.stderr is None:
+    try:
+        sys.stderr = open(os.path.join(os.path.dirname(__file__), "proxy.log"), "a", encoding="utf-8")
+    except Exception:
+        sys.stderr = open(os.devnull, "w")
+
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -233,10 +245,81 @@ async def root():
 async def vault_status():
     return {
         "count": len(vault.secret_to_placeholder),
+        "env_files": config.get("env_files", []),
         "mappings": [
             {"placeholder": p, "secret_prefix": s[:7] + "..." if len(s) > 10 else "***"}
             for p, s in vault.placeholder_to_secret.items()
         ]
+    }
+
+
+@app.post("/vault/add-secret")
+async def add_secret_endpoint(request: Request):
+    """
+    Adds an arbitrary secret string into the vault with optional label.
+    Handles deduplication: if the secret already exists, returns existing placeholder.
+    """
+    data = await request.json()
+    secret = data.get("secret", "").strip()
+    label = data.get("label", "").strip() or None
+
+    if not secret:
+        raise HTTPException(status_code=400, detail="Secret string cannot be empty")
+
+    # If secret is already known, return existing mapping without duplication
+    already_existed = secret in vault.secret_to_placeholder
+    placeholder = vault.register_secret(secret, label)
+
+    # Persist to secrets.json
+    try:
+        stored = {}
+        if os.path.exists(secrets_path):
+            with open(secrets_path, "r", encoding="utf-8") as f:
+                stored = json.load(f)
+        stored[placeholder] = secret
+        with open(secrets_path, "w", encoding="utf-8") as f:
+            json.dump(stored, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        log_warn(f"Failed to persist secret to secrets.json: {e}")
+
+    log_shield(f"Registered secret string -> {placeholder} (Existing: {already_existed})")
+
+    return {
+        "status": "ok",
+        "placeholder": placeholder,
+        "already_existed": already_existed,
+        "secret_preview": secret[:4] + "***" + secret[-2:] if len(secret) > 8 else "***",
+        "total_vault_secrets": len(vault.secret_to_placeholder)
+    }
+
+
+@app.post("/vault/add-env")
+async def add_env_endpoint(request: Request):
+    """Dynamically loads a .env file into the running vault and persists it to config.json."""
+    data = await request.json()
+    path = os.path.abspath(data.get("path", ""))
+
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail=f"File not found: {path}")
+
+    loaded_count = vault.load_env_file(path)
+
+    # Persist to config.json if not already present
+    env_list = config.setdefault("env_files", [])
+    if path not in env_list:
+        env_list.append(path)
+        try:
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            log_warn(f"Failed to update config.json: {e}")
+
+    log_shield(f"Dynamically registered .env: {path} (+{loaded_count} secrets)")
+    return {
+        "status": "ok",
+        "path": path,
+        "loaded_secrets": loaded_count,
+        "total_vault_secrets": len(vault.secret_to_placeholder)
     }
 
 

@@ -16,6 +16,7 @@
   "secrets_file": "secrets.json",
   "env_files": [
     ".env",
-    "C:/Users/dines/WebstormProjects/Internsuka/.env"
+    "C:/Users/dines/WebstormProjects/Internsuka/.env",
+    "C:\\Users\\dines\\WebstormProjects\\Internsuka\\.env"
   ]
 }
