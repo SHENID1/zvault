@@ -2,6 +2,7 @@ import re
 import json
 import os
 import math
+import ipaddress
 from collections import Counter
 from typing import Dict, List, Tuple, Any, Optional, Callable
 
@@ -20,6 +21,12 @@ IGNORE_ENV_KEYS = {
     "NODE_ENV", "PORT", "HOST", "DEBUG", "LOG_LEVEL", "ENV", "ENVIRONMENT",
     "PUBLIC_URL", "APP_ENV", "MODE", "BROWSER", "HTTPS", "TZ", "LANG", "CI",
     "PATH", "SHELL", "USER", "HOME", "HOSTNAME"
+}
+
+# System keys in LLM JSON payloads that should NOT be masked by entropy/regex
+SYSTEM_SAFE_KEYS = {
+    "id", "tool_call_id", "model", "signature", "encrypted_content",
+    "type", "role", "index", "object", "finish_reason", "status"
 }
 
 
@@ -69,9 +76,9 @@ class SecretVault:
         )
         self.ipv4_exempt = {"127.0.0.1", "0.0.0.0", "255.255.255.255", "1.1.1.1", "8.8.8.8", "8.8.4.4"}
 
-        # IPv6 pattern
-        self.ipv6_pattern = re.compile(
-            r"\b((?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4})\b"
+        # IPv6 candidate pattern (checked strictly via ipaddress)
+        self.ipv6_candidate_pattern = re.compile(
+            r"\b([0-9a-fA-F:]{3,39})\b"
         )
 
         # Contextual assignment patterns (e.g. DB_PASSWORD = "...", apiKey: "...", token = "...")
@@ -125,7 +132,11 @@ class SecretVault:
         return loaded
 
     def load_secrets_file(self, path: str):
-        """Loads static secrets from a JSON or line-based text file."""
+        """
+        Loads static secrets from JSON or line-based text file.
+        Strict schema: JSON key is ALWAYS the label/placeholder, and value is ALWAYS the secret.
+        No direction heuristics based on string length!
+        """
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
@@ -135,10 +146,10 @@ class SecretVault:
                 if content.startswith("{"):
                     data = json.loads(content)
                     for k, v in data.items():
-                        if isinstance(v, str) and (len(v) > len(k) or v.startswith("sk-") or v.startswith("ghp_")):
-                            self.register_secret(v, k)
-                        else:
-                            self.register_secret(k, str(v))
+                        if isinstance(v, str) and v.strip():
+                            self.register_secret(v.strip(), k.strip())
+                        elif isinstance(v, (int, float, bool)):
+                            self.register_secret(str(v), k.strip())
                 else:
                     for line in content.splitlines():
                         line = line.strip()
@@ -188,7 +199,8 @@ class SecretVault:
         Smart Scanner:
         1. Contextual assignments (e.g. token = "...", password: "...")
         2. Known signatures (OpenAI, Anthropic, Google, AWS, GitHub, etc.)
-        3. Shannon Entropy analysis for high-randomness strings
+        3. Shannon Entropy analysis for high-randomness strings (excluding IDs)
+        4. IPv4 / IPv6 validation via standard library
         """
         found = []
 
@@ -224,10 +236,13 @@ class SecretVault:
         for token in potential_tokens:
             if token in self.secret_to_placeholder or token.startswith("__VAULT_"):
                 continue
+            # Skip system IDs and model names
+            if any(token.startswith(pfx) for pfx in ("call_", "toolu_", "chatcmpl-", "msg_", "resp_", "ft:", "gpt-", "claude-")):
+                continue
             # Must contain both letters and digits
             if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
-                # Ignore URLs, typical paths or package names
-                if not token.startswith("http") and not "/" in token:
+                # Ignore URLs, paths or package names
+                if not token.startswith("http") and "/" not in token:
                     h = calculate_shannon_entropy(token)
                     if h >= 4.15:
                         ph = self.register_secret(token, "ENTROPY_KEY")
@@ -251,13 +266,24 @@ class SecretVault:
                 ph = self.register_secret(ip, "IP_ADDR")
             found.append((ip, ph))
 
-        # 6. IPv6 Addresses
-        for m in self.ipv6_pattern.finditer(text):
-            ip6 = m.group(1)
-            if ip6 in ("::1", "::") or ip6 in self.secret_to_placeholder or ip6.startswith("__VAULT_"):
+        # 6. IPv6 Addresses (Validated strictly with ipaddress module)
+        for m in self.ipv6_candidate_pattern.finditer(text):
+            cand = m.group(1)
+            # Must have at least two colons
+            if cand.count(":") < 2:
                 continue
-            ph = self.register_secret(ip6, "IPV6_ADDR")
-            found.append((ip6, ph))
+            try:
+                ip_obj = ipaddress.IPv6Address(cand)
+                # Ignore loopback (::1) and unspecified (::)
+                if ip_obj.is_loopback or ip_obj.is_unspecified:
+                    continue
+                if cand in self.secret_to_placeholder or cand.startswith("__VAULT_"):
+                    continue
+                ph = self.register_secret(cand, "IPV6_ADDR")
+                found.append((cand, ph))
+            except ValueError:
+                # Not a valid IPv6 address (e.g. timestamp 12:30:45, MAC address)
+                continue
 
         return found
 
@@ -299,14 +325,21 @@ class SecretVault:
             new_dict = {}
             total_replacements = 0
             for k, v in data.items():
+                # Skip masking system identification keys like id, tool_call_id, model
+                if k in SYSTEM_SAFE_KEYS:
+                    new_dict[k] = v
+                    continue
                 masked_v, count = self.mask_payload(v)
                 new_dict[k] = masked_v
                 total_replacements += count
             return new_dict, total_replacements
         return data, 0
 
-    def demask_text(self, text: str) -> Tuple[str, int]:
-        """Restores placeholders in text back to real secrets."""
+    def demask_text(self, text: str, json_escaped: bool = False) -> Tuple[str, int]:
+        """
+        Restores placeholders in text back to real secrets.
+        If json_escaped is True, replaces with JSON-escaped string literal (e.g. \n -> \\n, " -> \").
+        """
         if not text:
             return text, 0
 
@@ -318,12 +351,51 @@ class SecretVault:
                 real_secret = self.placeholder_to_secret[placeholder]
                 count = result.count(placeholder)
                 if count > 0:
-                    result = result.replace(placeholder, real_secret)
+                    if json_escaped:
+                        # Escapes special characters properly for inclusion inside JSON strings
+                        replacement = json.dumps(real_secret)[1:-1]
+                    else:
+                        replacement = real_secret
+                    result = result.replace(placeholder, replacement)
                     restorations += count
                     if self.on_demask:
                         self.on_demask(placeholder, real_secret)
 
         return result, restorations
+
+    def demask_payload(self, data: Any) -> Tuple[Any, int]:
+        """Recursively demasks string values in a JSON-serializable structure (dicts/lists)."""
+        if isinstance(data, str):
+            return self.demask_text(data)
+        elif isinstance(data, list):
+            new_list = []
+            total_restorations = 0
+            for item in data:
+                demasked_item, count = self.demask_payload(item)
+                new_list.append(demasked_item)
+                total_restorations += count
+            return new_list, total_restorations
+        elif isinstance(data, dict):
+            new_dict = {}
+            total_restorations = 0
+            for k, v in data.items():
+                demasked_v, count = self.demask_payload(v)
+                new_dict[k] = demasked_v
+                total_restorations += count
+            return new_dict, total_restorations
+        return data, 0
+
+    def demask_json_str(self, text: str) -> Tuple[str, int]:
+        """
+        Safely demasks a JSON string by parsing it into structured Python objects first,
+        guaranteeing that secrets with quotes or newlines do not produce invalid JSON control characters.
+        """
+        try:
+            parsed = json.loads(text)
+            demasked_obj, count = self.demask_payload(parsed)
+            return json.dumps(demasked_obj, ensure_ascii=False), count
+        except Exception:
+            return self.demask_text(text, json_escaped=True)
 
 
 class TextStreamDemasker:
@@ -331,9 +403,10 @@ class TextStreamDemasker:
     Stateful buffer for continuous text stream (e.g. delta field inside SSE).
     Buffers only when an unclosed '__' placeholder prefix is detected at the tail.
     """
-    def __init__(self, vault: SecretVault, max_placeholder_len: int = 40):
+    def __init__(self, vault: SecretVault, max_placeholder_len: int = 40, json_escaped: bool = False):
         self.vault = vault
         self.max_placeholder_len = max_placeholder_len
+        self.json_escaped = json_escaped
         self.buffer = ""
 
     def process(self, text: str) -> str:
@@ -343,7 +416,7 @@ class TextStreamDemasker:
         self.buffer += text
 
         # Demask any complete placeholders currently in buffer
-        self.buffer, _ = self.vault.demask_text(self.buffer)
+        self.buffer, _ = self.vault.demask_text(self.buffer, json_escaped=self.json_escaped)
 
         # Look for the last '__' in the buffer
         last_double_underscore = self.buffer.rfind("__")
@@ -370,7 +443,7 @@ class TextStreamDemasker:
         return to_emit
 
     def flush(self) -> str:
-        final_text, _ = self.vault.demask_text(self.buffer)
+        final_text, _ = self.vault.demask_text(self.buffer, json_escaped=self.json_escaped)
         self.buffer = ""
         return final_text
 
@@ -379,17 +452,24 @@ class SSEStreamDemasker:
     """
     Universal Demasker for Server-Sent Events (SSE).
     Supports:
-    1. OpenAI Realtime / Responses API (`openai-responses` format: `type: response.output_text.delta`, `delta: str`)
-    2. OpenAI Chat Completions (`choices[].delta.content`)
-    3. Anthropic (`type: content_block_delta`, `delta.text`)
+    1. OpenAI Realtime / Responses API (`openai-responses` format: `response.output_text.delta`, `response.function_call_arguments.delta`)
+    2. OpenAI Chat Completions (`choices[].delta.content`, `reasoning_content`, `tool_calls[].function.arguments`)
+    3. Anthropic (`type: content_block_delta`, `delta.text`, `delta.partial_json`)
     4. Arbitrary JSON text fields and fallback raw SSE streams
     """
     def __init__(self, vault: SecretVault):
         self.vault = vault
         self.raw_line_buffer = ""
-        self.content_demasker = TextStreamDemasker(vault)
+        self.content_demasker = TextStreamDemasker(vault, json_escaped=False)
+        self.reasoning_demasker = TextStreamDemasker(vault, json_escaped=False)
+        self.stream_demaskers: Dict[str, TextStreamDemasker] = {}
         self.last_responses_event: Optional[Dict[str, Any]] = None
         self.saw_choices: bool = False
+
+    def _get_stream_demasker(self, key: str, json_escaped: bool = False) -> TextStreamDemasker:
+        if key not in self.stream_demaskers:
+            self.stream_demaskers[key] = TextStreamDemasker(self.vault, json_escaped=json_escaped)
+        return self.stream_demaskers[key]
 
     def process_raw_chunk(self, chunk: str) -> str:
         self.raw_line_buffer += chunk
@@ -407,16 +487,10 @@ class SSEStreamDemasker:
                 data_str = line[5:].strip()
 
                 if data_str == "[DONE]":
-                    # Flush before [DONE]
-                    flushed = self.content_demasker.flush()
+                    # Flush all buffers before [DONE]
+                    flushed = self.flush_internal()
                     if flushed:
-                        if self.last_responses_event:
-                            ev = dict(self.last_responses_event)
-                            ev["delta"] = flushed
-                            output.append(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
-                        elif self.saw_choices:
-                            synth = {"choices": [{"index": 0, "delta": {"content": flushed}}]}
-                            output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+                        output.append(flushed)
                     output.append("data: [DONE]\n\n")
                     continue
 
@@ -424,45 +498,61 @@ class SSEStreamDemasker:
                     event_data = json.loads(data_str)
                     modified = False
 
-                    # 1. Format: OpenAI Responses API (e.g. response.output_text.delta)
-                    # Used by ZCode when api.type == "openai-responses"!
-                    if isinstance(event_data, dict) and "delta" in event_data and isinstance(event_data["delta"], str):
-                        event_data["delta"] = self.content_demasker.process(event_data["delta"])
-                        self.last_responses_event = dict(event_data)
-                        modified = True
+                    # 1. Format: OpenAI Responses API
+                    if isinstance(event_data, dict):
+                        ev_type = event_data.get("type", "")
 
-                    # 2. Format: OpenAI Chat Completions (choices -> delta -> content)
-                    elif isinstance(event_data, dict) and "choices" in event_data and isinstance(event_data["choices"], list):
-                        self.saw_choices = True
-                        for choice in event_data.get("choices", []):
-                            delta = choice.get("delta", {})
-                            if isinstance(delta, dict):
-                                if "content" in delta and isinstance(delta["content"], str):
-                                    delta["content"] = self.content_demasker.process(delta["content"])
-                                    modified = True
-                                if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
-                                    delta["reasoning_content"] = self.content_demasker.process(delta["reasoning_content"])
-                                    modified = True
-
-                    # 3. Format: Anthropic (delta.text or content_block)
-                    elif isinstance(event_data, dict) and "delta" in event_data and isinstance(event_data["delta"], dict):
-                        if "text" in event_data["delta"] and isinstance(event_data["delta"]["text"], str):
-                            event_data["delta"]["text"] = self.content_demasker.process(event_data["delta"]["text"])
+                        # Text delta
+                        if "delta" in event_data and isinstance(event_data["delta"], str):
+                            if ev_type == "response.function_call_arguments.delta":
+                                call_id = event_data.get("call_id", "default")
+                                demasker = self._get_stream_demasker(f"resp_fn_{call_id}", json_escaped=True)
+                                event_data["delta"] = demasker.process(event_data["delta"])
+                            else:
+                                event_data["delta"] = self.content_demasker.process(event_data["delta"])
+                            self.last_responses_event = dict(event_data)
                             modified = True
 
-                    # 4. Universal fallback: recursive string demasking for any other JSON structure
-                    if not modified and isinstance(event_data, (dict, list)):
-                        def recursive_demask(item):
-                            if isinstance(item, str):
-                                res, _ = self.vault.demask_text(item)
-                                return res
-                            elif isinstance(item, list):
-                                return [recursive_demask(x) for x in item]
-                            elif isinstance(item, dict):
-                                return {k: recursive_demask(v) for k, v in item.items()}
-                            return item
+                        # 2. Format: OpenAI Chat Completions (choices -> delta)
+                        elif "choices" in event_data and isinstance(event_data["choices"], list):
+                            self.saw_choices = True
+                            for choice in event_data.get("choices", []):
+                                c_idx = choice.get("index", 0)
+                                delta = choice.get("delta", {})
+                                if isinstance(delta, dict):
+                                    if "content" in delta and isinstance(delta["content"], str):
+                                        delta["content"] = self.content_demasker.process(delta["content"])
+                                        modified = True
+                                    if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
+                                        delta["reasoning_content"] = self.reasoning_demasker.process(delta["reasoning_content"])
+                                        modified = True
+                                    # Support tool_calls arguments streaming in OpenAI format
+                                    if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
+                                        for tc in delta["tool_calls"]:
+                                            tc_idx = tc.get("index", 0)
+                                            func = tc.get("function", {})
+                                            if isinstance(func, dict) and "arguments" in func and isinstance(func["arguments"], str):
+                                                key = f"openai_tc_{c_idx}_{tc_idx}"
+                                                tc_demasker = self._get_stream_demasker(key, json_escaped=True)
+                                                func["arguments"] = tc_demasker.process(func["arguments"])
+                                                modified = True
 
-                        event_data = recursive_demask(event_data)
+                        # 3. Format: Anthropic (content_block_delta -> delta.text or delta.partial_json)
+                        elif "delta" in event_data and isinstance(event_data["delta"], dict):
+                            delta_obj = event_data["delta"]
+                            block_idx = event_data.get("index", 0)
+                            if "text" in delta_obj and isinstance(delta_obj["text"], str):
+                                delta_obj["text"] = self.content_demasker.process(delta_obj["text"])
+                                modified = True
+                            if "partial_json" in delta_obj and isinstance(delta_obj["partial_json"], str):
+                                key = f"anthropic_block_{block_idx}"
+                                tc_demasker = self._get_stream_demasker(key, json_escaped=True)
+                                delta_obj["partial_json"] = tc_demasker.process(delta_obj["partial_json"])
+                                modified = True
+
+                    # 4. Universal fallback: recursive string demasking for other JSON payloads
+                    if not modified and isinstance(event_data, (dict, list)):
+                        event_data, _ = self.vault.demask_payload(event_data)
 
                     output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n")
 
@@ -477,18 +567,42 @@ class SSEStreamDemasker:
 
         return "".join(output)
 
-    def flush(self) -> str:
+    def flush_internal(self) -> str:
         output = []
-        flushed = self.content_demasker.flush()
-        if flushed:
+        flushed_content = self.content_demasker.flush()
+        if flushed_content:
             if self.last_responses_event:
                 ev = dict(self.last_responses_event)
-                ev["delta"] = flushed
+                ev["delta"] = flushed_content
                 output.append(f"data: {json.dumps(ev, ensure_ascii=False)}\n\n")
             elif self.saw_choices:
-                synth = {"choices": [{"index": 0, "delta": {"content": flushed}}]}
+                synth = {"choices": [{"index": 0, "delta": {"content": flushed_content}}]}
                 output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
 
+        # Flush any remaining tool call / stream buffers
+        for key, demasker in list(self.stream_demaskers.items()):
+            flushed_extra = demasker.flush()
+            if flushed_extra:
+                # If Anthropic block
+                if key.startswith("anthropic_block_"):
+                    try:
+                        b_idx = int(key.split("_")[-1])
+                    except Exception:
+                        b_idx = 0
+                    synth = {"type": "content_block_delta", "index": b_idx, "delta": {"type": "input_json_delta", "partial_json": flushed_extra}}
+                    output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+                elif key.startswith("openai_tc_"):
+                    parts = key.split("_")
+                    c_idx = int(parts[2]) if len(parts) > 2 else 0
+                    t_idx = int(parts[3]) if len(parts) > 3 else 0
+                    synth = {"choices": [{"index": c_idx, "delta": {"tool_calls": [{"index": t_idx, "function": {"arguments": flushed_extra}}]}}]}
+                    output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+
+        self.stream_demaskers.clear()
+        return "".join(output)
+
+    def flush(self) -> str:
+        output = [self.flush_internal()]
         if self.raw_line_buffer:
             demasked_rem, _ = self.vault.demask_text(self.raw_line_buffer)
             output.append(demasked_rem)

@@ -1,10 +1,14 @@
 import sys
 import os
+import re
 import json
 import time
+import signal
+import getpass
 import subprocess
 import urllib.request
 import urllib.error
+from typing import Dict, Optional
 
 PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
@@ -24,6 +28,21 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 
+def get_auth_headers() -> Dict[str, str]:
+    """Retrieves CLI headers including authentication token from config.json."""
+    headers = {"User-Agent": "ZVault-CLI"}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg = json.load(f)
+                token = cfg.get("vault_token")
+                if token:
+                    headers["X-Vault-Token"] = token
+        except Exception:
+            pass
+    return headers
+
+
 def is_running() -> bool:
     """Checks if the proxy server is responding on its port."""
     try:
@@ -34,19 +53,26 @@ def is_running() -> bool:
         return False
 
 
-def get_pid() -> int | None:
+def get_pid() -> Optional[int]:
     """Reads PID from pid file if valid and running."""
     if os.path.exists(PID_FILE):
         try:
             with open(PID_FILE, "r") as f:
                 pid = int(f.read().strip())
-            # Check if process with this PID actually exists on Windows
-            check = subprocess.run(
-                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"],
-                capture_output=True, text=True
-            )
-            if str(pid) in check.stdout:
-                return pid
+
+            if sys.platform == "win32":
+                check = subprocess.run(
+                    ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"],
+                    capture_output=True, text=True
+                )
+                if str(pid) in check.stdout:
+                    return pid
+            else:
+                try:
+                    os.kill(pid, 0)
+                    return pid
+                except OSError:
+                    pass
         except Exception:
             pass
     return None
@@ -74,8 +100,7 @@ def cmd_start(args):
         print(f"Starting {CYAN}{BOLD}ZVault{RESET} on {GREEN}{BASE_URL}{RESET}...", end=" ", flush=True)
 
         if sys.platform == "win32":
-            # CREATE_NEW_CONSOLE (0x00000010) starts a detached, independent Windows process
-            creationflags = 0x00000010
+            creationflags = 0x00000010  # CREATE_NEW_CONSOLE
             proc = subprocess.Popen(
                 [python_exe, SERVER_PY],
                 cwd=PROXY_DIR,
@@ -95,7 +120,6 @@ def cmd_start(args):
             with open(PID_FILE, "w") as f:
                 f.write(str(proc.pid))
 
-        # Wait up to 4 seconds for server to start
         started = False
         for _ in range(16):
             time.sleep(0.25)
@@ -120,21 +144,32 @@ def cmd_stop():
 
     if pid:
         try:
-            subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
+            else:
+                os.kill(pid, signal.SIGTERM)
             stopped = True
         except Exception:
             pass
 
-    # If PID file was stale or missing, find process holding port 8765
+    # If PID file was stale or missing, find process listening strictly on :PORT
     if not stopped or is_running():
         try:
-            netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
-            for line in netstat.stdout.splitlines():
-                if f":{PORT}" in line and "LISTENING" in line:
-                    parts = line.strip().split()
-                    port_pid = parts[-1]
-                    subprocess.run(["taskkill", "/F", "/PID", port_pid], capture_output=True)
-                    stopped = True
+            if sys.platform == "win32":
+                netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+                port_regex = re.compile(rf":{PORT}\s")
+                for line in netstat.stdout.splitlines():
+                    if port_regex.search(line) and "LISTENING" in line:
+                        parts = line.strip().split()
+                        port_pid = parts[-1]
+                        subprocess.run(["taskkill", "/F", "/PID", port_pid], capture_output=True)
+                        stopped = True
+            else:
+                lsof = subprocess.run(["lsof", "-t", f"-i:{PORT}"], capture_output=True, text=True)
+                for p in lsof.stdout.strip().splitlines():
+                    if p:
+                        os.kill(int(p), signal.SIGKILL)
+                        stopped = True
         except Exception:
             pass
 
@@ -164,7 +199,7 @@ def cmd_status():
         print(f"\n{GREEN}{BOLD}● ZVault is RUNNING{RESET}{pid_str} on {CYAN}{BASE_URL}{RESET}")
 
         try:
-            req = urllib.request.Request(f"{BASE_URL}/vault/status")
+            req = urllib.request.Request(f"{BASE_URL}/vault/status", headers=get_auth_headers())
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 print(f"  Total secrets in vault: {GREEN}{data.get('count', 0)}{RESET}")
@@ -175,7 +210,7 @@ def cmd_status():
             print(f"  (Failed to query details: {e})")
 
         try:
-            req = urllib.request.Request(f"{BASE_URL}/")
+            req = urllib.request.Request(f"{BASE_URL}/", headers={"User-Agent": "ZVault-CLI"})
             with urllib.request.urlopen(req, timeout=2.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 print(f"  Upstreams configured: {YELLOW}{', '.join(data.get('upstreams', []))}{RESET}")
@@ -206,13 +241,15 @@ def cmd_add(path_arg: str):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
-    # 2. If running, notify server dynamically
+    # 2. If running, notify server dynamically with auth headers
     if is_running():
         try:
+            headers = get_auth_headers()
+            headers["Content-Type"] = "application/json"
             req = urllib.request.Request(
                 f"{BASE_URL}/vault/add-env",
                 data=json.dumps({"path": abs_path}).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
+                headers=headers
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 res_data = json.loads(resp.read().decode("utf-8"))
@@ -229,7 +266,7 @@ def cmd_add(path_arg: str):
     print(f"  Path: {CYAN}{abs_path}{RESET}")
 
 
-def cmd_str(secret: str, label: str | None = None):
+def cmd_str(secret: str, label: Optional[str] = None):
     """
     Adds a custom sensitive string to the vault with collision & duplicate handling.
     """
@@ -237,13 +274,15 @@ def cmd_str(secret: str, label: str | None = None):
         print(f"{RED}Error:{RESET} Secret string cannot be empty.")
         return
 
-    # If server is running, use live API
+    # If server is running, use live authenticated API
     if is_running():
         try:
+            headers = get_auth_headers()
+            headers["Content-Type"] = "application/json"
             req = urllib.request.Request(
                 f"{BASE_URL}/vault/add-secret",
                 data=json.dumps({"secret": secret, "label": label or "STR"}).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
+                headers=headers
             )
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -271,20 +310,20 @@ def cmd_str(secret: str, label: str | None = None):
             stored = {}
 
     # Check for exact duplicate secret
-    existing_ph = None
     for ph, sec in stored.items():
         if sec == secret:
-            existing_ph = ph
-            break
+            print(f"{YELLOW}Secret already registered!{RESET} Reusing placeholder: {GREEN}{BOLD}{ph}{RESET}")
+            return
 
-    if existing_ph:
-        print(f"{YELLOW}Secret already registered!{RESET} Reusing placeholder: {GREEN}{BOLD}{existing_ph}{RESET}")
-        return
-
-    # Generate unique placeholder with label and counter
+    # Generate unique placeholder avoiding collisions even after deletions
     clean_label = (label or "STR").upper()
-    next_idx = len(stored) + 1
-    new_ph = f"__VAULT_{clean_label}_{next_idx:02d}__"
+    next_idx = 1
+    while True:
+        new_ph = f"__VAULT_{clean_label}_{next_idx:02d}__"
+        if new_ph not in stored:
+            break
+        next_idx += 1
+
     stored[new_ph] = secret
 
     with open(secrets_path, "w", encoding="utf-8") as f:
@@ -315,7 +354,7 @@ def print_help():
   zv restart                 Restart proxy
   zv status                  Show status, active secrets count, and loaded .env files
   zv add <path>              Add a .env file (e.g. `zv add ./.env` or `zv add C:/path/.env`)
-  zv str "<secret>" ["TAG"]  Add an ad-hoc secret string (with optional label)
+  zv str ["<secret>"] ["TAG"] Add an ad-hoc secret string (prompts securely if omitted)
   zv logs                    View recent background logs
   zv help                    Show this help message
 
@@ -349,10 +388,15 @@ def main():
         cmd_add(args[1])
     elif command in ("str", "secret"):
         if len(args) < 2:
-            print(f"{RED}Usage:{RESET} zv str \"<secret>\" [\"<label>\"]")
-            return
-        secret_val = args[1]
-        label_val = args[2] if len(args) > 2 else None
+            # Secure interactive input to avoid leaking secret in shell history / process table
+            try:
+                secret_val = getpass.getpass("Enter secret string (input hidden): ").strip()
+            except Exception:
+                secret_val = input("Enter secret string: ").strip()
+            label_val = input("Optional label (or press Enter for default): ").strip() or None
+        else:
+            secret_val = args[1]
+            label_val = args[2] if len(args) > 2 else None
         cmd_str(secret_val, label_val)
     elif command == "logs":
         cmd_logs()

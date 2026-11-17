@@ -2,6 +2,8 @@ import json
 import os
 import re
 import sys
+import codecs
+from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
 
@@ -19,7 +21,6 @@ if sys.stderr is None:
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import uvicorn
 
@@ -39,20 +40,26 @@ CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
 config: Dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
+    "vault_token": "zvault_sec_local_d98f7e2a4b1c8360",
     "upstreams": {
         "agentrouter": "https://agentrouter.org/v1",
-        "aegis": "https://aegis-ubuntu.tailcfa41a.ts.net/v1"
+        "bigmodel": "https://open.bigmodel.cn/api/paas/v4"
     },
     "allowed_hosts": [
         "agentrouter.org",
-        "aegis-ubuntu.tailcfa41a.ts.net"
+        "open.bigmodel.cn",
+        "api.openai.com",
+        "api.anthropic.com"
     ],
     "secrets_file": "secrets.json"
 }
 
 if os.path.exists(CONFIG_FILE):
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        config.update(json.load(f))
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            config.update(json.load(f))
+    except Exception as e:
+        print(f"[WARN] Error reading config.json: {e}")
 
 # Initialize Vault & Injection Guard
 secrets_path = os.path.join(os.path.dirname(__file__), config.get("secrets_file", "secrets.json"))
@@ -60,18 +67,20 @@ env_files = config.get("env_files", [".env"])
 vault = SecretVault(secrets_path, env_files=env_files)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
-injection_cfg = config.get("injection_guard", {"enabled": True, "action": "warn", "sensitivity": 0.65})
+injection_cfg = config.get("injection_guard", {"enabled": True, "action": "block", "sensitivity": 0.65})
 injection_guard = PromptInjectionGuard(sensitivity=float(injection_cfg.get("sensitivity", 0.65)))
 
-app = FastAPI(title="ZCode Secret Masking Proxy", version="1.0.0")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Persistent AsyncClient to avoid creating new connections on every request
+    app.state.client = httpx.AsyncClient(timeout=180.0, follow_redirects=False)
+    yield
+    await app.state.client.aclose()
+
+
+app = FastAPI(title="ZCode Secret Masking Proxy", version="1.1.0", lifespan=lifespan)
+
 
 def log_shield(msg: str):
     print(f"{CYAN}{BOLD}[SHIELD]{RESET} {msg}")
@@ -86,11 +95,61 @@ def log_warn(msg: str):
     print(f"{RED}{BOLD}[WARN ⚠️]{RESET} {msg}")
 
 
-def check_domain_allowed(host: str) -> bool:
+@app.middleware("http")
+async def dns_rebinding_protection(request: Request, call_next):
+    """
+    Protects against DNS rebinding attacks by validating the incoming Host header.
+    Only allows local loopback and the explicitly configured binding host.
+    """
+    host_header = request.headers.get("host", "")
+    req_host = host_header.split(":")[0].strip().lower()
+    configured_host = str(config.get("host", "127.0.0.1")).lower()
+    allowed_server_hosts = {"127.0.0.1", "localhost", "::1", configured_host}
+
+    if req_host not in allowed_server_hosts:
+        return Response(
+            content="Forbidden: Invalid Host header (DNS rebinding protection)",
+            status_code=403
+        )
+    return await call_next(request)
+
+
+def verify_vault_token(request: Request):
+    """
+    Authenticates requests to management and test endpoints (/vault/*, /test-echo).
+    """
+    expected_token = config.get("vault_token")
+    if not expected_token:
+        return
+
+    token = request.headers.get("X-Vault-Token")
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+
+    if token != expected_token:
+        raise HTTPException(status_code=401, detail="Unauthorized: valid X-Vault-Token required")
+
+
+def check_domain_allowed(target_url: str) -> bool:
+    """
+    Strictly validates target host:
+    - Rejects credentials (userinfo) in authority
+    - Matches hostname against explicit allowed_hosts whitelist
+    - Disallows forwarding if whitelist is empty
+    """
+    parsed = urlparse(target_url)
+    if parsed.username or parsed.password:
+        log_warn(f"Target URL '{target_url}' contains credentials in authority! Request blocked.")
+        return False
+
+    target_host = (parsed.hostname or "").lower()
     allowed = config.get("allowed_hosts", [])
-    if not allowed:
-        return True
-    return any(host == a or host.endswith("." + a) for a in allowed)
+    if not allowed or not target_host:
+        return False
+
+    return any(target_host == a.lower() or target_host.endswith("." + a.lower()) for a in allowed)
 
 
 def resolve_target_url(upstream_name_or_scheme: str, subpath: str) -> str:
@@ -120,13 +179,13 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
     parsed = urlparse(target_url)
     target_host = parsed.netloc
 
-    if not check_domain_allowed(target_host):
-        log_warn(f"Domain '{target_host}' is NOT in allowed_hosts list! Request blocked for security.")
-        raise HTTPException(status_code=403, detail=f"Host '{target_host}' not in allowed_hosts")
+    if not check_domain_allowed(target_url):
+        log_warn(f"Target URL '{target_url}' is NOT in allowed_hosts list! Request blocked for security.")
+        raise HTTPException(status_code=403, detail="Target host not in allowed_hosts")
 
     log_shield(f"{request.method} -> {target_url}")
 
-    # 1. Read and mask request body
+    # 1. Read and mask request body (Fail-Closed)
     raw_body = await request.body()
     masked_body = raw_body
 
@@ -139,7 +198,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                 msgs = body_json.get("messages", body_json.get("input", []))
                 inj_res = injection_guard.scan_messages(msgs)
                 if inj_res.is_malicious:
-                    action = injection_cfg.get("action", "warn").lower()
+                    action = injection_cfg.get("action", "block").lower()
                     if action == "block":
                         log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
                         raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
@@ -149,31 +208,40 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             masked_json, count = vault.mask_payload(body_json)
             if count > 0:
                 log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
-            masked_body = json.dumps(masked_json).encode("utf-8")
+            masked_body = json.dumps(masked_json, ensure_ascii=False).encode("utf-8")
+        except HTTPException:
+            raise
         except Exception:
-            # Fallback to plain text masking
+            # Fallback to plain text masking; fail closed if text masking also fails
             try:
                 body_str = raw_body.decode("utf-8")
                 masked_str, count = vault.mask_text(body_str)
                 if count > 0:
                     log_mask(f"Replaced {count} secret(s) in raw text before sending to {target_host}")
                 masked_body = masked_str.encode("utf-8")
-            except Exception:
-                pass
+            except Exception as ex:
+                log_warn(f"Masking pipeline failed: {ex}")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
+                )
 
-    # 2. Prepare headers (forward Authorization, Content-Type, etc.)
+    # 2. Prepare headers
     forward_headers = {}
     for k, v in request.headers.items():
         if k.lower() not in ("host", "content-length", "connection", "accept-encoding"):
             forward_headers[k] = v
 
-    forward_headers["Host"] = target_host
+    forward_headers["Host"] = parsed.hostname or target_host
 
     # 3. Forward request to upstream
-    client = httpx.AsyncClient(timeout=180.0, follow_redirects=True)
+    client: httpx.AsyncClient = getattr(request.app.state, "client", None)
+    own_client = False
+    if client is None:
+        client = httpx.AsyncClient(timeout=180.0, follow_redirects=False)
+        own_client = True
 
     try:
-        # Build query string
         query = str(request.url.query)
         req_url = f"{target_url}?{query}" if query else target_url
 
@@ -184,7 +252,6 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             content=masked_body
         )
         upstream_resp = await client.send(upstream_req, stream=True)
-
         content_type = upstream_resp.headers.get("content-type", "")
 
         # 4. Handle Streaming SSE Responses
@@ -193,10 +260,19 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             sse_demasker = SSEStreamDemasker(vault)
 
             async def sse_generator():
+                decoder = codecs.getincrementaldecoder("utf-8")()
                 try:
                     async for chunk_bytes in upstream_resp.aiter_bytes():
-                        chunk_str = chunk_bytes.decode("utf-8", errors="replace")
-                        demasked_part = sse_demasker.process_raw_chunk(chunk_str)
+                        # Incremental UTF-8 decoder prevents corrupted multibyte characters (Cyrillic, emojis)
+                        chunk_str = decoder.decode(chunk_bytes, final=False)
+                        if chunk_str:
+                            demasked_part = sse_demasker.process_raw_chunk(chunk_str)
+                            if demasked_part:
+                                yield demasked_part.encode("utf-8")
+
+                    final_str = decoder.decode(b"", final=True)
+                    if final_str:
+                        demasked_part = sse_demasker.process_raw_chunk(final_str)
                         if demasked_part:
                             yield demasked_part.encode("utf-8")
 
@@ -205,7 +281,8 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                         yield final_part.encode("utf-8")
                 finally:
                     await upstream_resp.aclose()
-                    await client.aclose()
+                    if own_client:
+                        await client.aclose()
 
             resp_headers = {
                 k: v for k, v in upstream_resp.headers.items()
@@ -219,12 +296,15 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             )
 
         # 5. Handle Non-Streaming Responses (Normal JSON / Text)
-        resp_bytes = await upstream_resp.aread()
-        await upstream_resp.aclose()
-        await client.aclose()
+        try:
+            resp_bytes = await upstream_resp.aread()
+        finally:
+            await upstream_resp.aclose()
+            if own_client:
+                await client.aclose()
 
         resp_text = resp_bytes.decode("utf-8", errors="replace")
-        demasked_text, demask_count = vault.demask_text(resp_text)
+        demasked_text, demask_count = vault.demask_json_str(resp_text)
         if demask_count > 0:
             log_demask(f"Restored {demask_count} secret placeholder(s) in response body!")
 
@@ -240,8 +320,11 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             media_type=content_type or "application/json"
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        await client.aclose()
+        if own_client:
+            await client.aclose()
         log_warn(f"Proxy error forwarding to {target_url}: {e}")
         raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
 
@@ -252,30 +335,24 @@ async def root():
         "status": "online",
         "service": "ZCode Secret Masking Proxy",
         "vault_secrets_count": len(vault.secret_to_placeholder),
-        "registered_placeholders": list(vault.placeholder_to_secret.keys()),
         "upstreams": list(config.get("upstreams", {}).keys()),
         "allowed_hosts": config.get("allowed_hosts", [])
     }
 
 
 @app.get("/vault/status")
-async def vault_status():
+async def vault_status(request: Request):
+    verify_vault_token(request)
     return {
         "count": len(vault.secret_to_placeholder),
         "env_files": config.get("env_files", []),
-        "mappings": [
-            {"placeholder": p, "secret_prefix": s[:7] + "..." if len(s) > 10 else "***"}
-            for p, s in vault.placeholder_to_secret.items()
-        ]
+        "placeholders": list(vault.placeholder_to_secret.keys())
     }
 
 
 @app.post("/vault/add-secret")
 async def add_secret_endpoint(request: Request):
-    """
-    Adds an arbitrary secret string into the vault with optional label.
-    Handles deduplication: if the secret already exists, returns existing placeholder.
-    """
+    verify_vault_token(request)
     data = await request.json()
     secret = data.get("secret", "").strip()
     label = data.get("label", "").strip() or None
@@ -283,7 +360,6 @@ async def add_secret_endpoint(request: Request):
     if not secret:
         raise HTTPException(status_code=400, detail="Secret string cannot be empty")
 
-    # If secret is already known, return existing mapping without duplication
     already_existed = secret in vault.secret_to_placeholder
     placeholder = vault.register_secret(secret, label)
 
@@ -305,14 +381,13 @@ async def add_secret_endpoint(request: Request):
         "status": "ok",
         "placeholder": placeholder,
         "already_existed": already_existed,
-        "secret_preview": secret[:4] + "***" + secret[-2:] if len(secret) > 8 else "***",
         "total_vault_secrets": len(vault.secret_to_placeholder)
     }
 
 
 @app.post("/vault/add-env")
 async def add_env_endpoint(request: Request):
-    """Dynamically loads a .env file into the running vault and persists it to config.json."""
+    verify_vault_token(request)
     data = await request.json()
     path = os.path.abspath(data.get("path", ""))
 
@@ -342,11 +417,7 @@ async def add_env_endpoint(request: Request):
 
 @app.post("/test-echo")
 async def test_echo(request: Request):
-    """
-    Offline safe test endpoint.
-    Demonstrates what an untrusted API would see vs what ZCode receives back,
-    plus prompt injection detection analysis.
-    """
+    verify_vault_token(request)
     raw_body = await request.body()
     try:
         body_json = json.loads(raw_body.decode("utf-8"))
@@ -354,8 +425,7 @@ async def test_echo(request: Request):
         inj_res = injection_guard.scan_messages(msgs)
 
         masked_json, mask_count = vault.mask_payload(body_json)
-        simulated_api_view = json.dumps(masked_json, ensure_ascii=False)
-        demasked_view, demask_count = vault.demask_text(simulated_api_view)
+        _, demask_count = vault.demask_payload(masked_json)
 
         return {
             "status": "success",
@@ -368,7 +438,8 @@ async def test_echo(request: Request):
                 "has_obfuscation": inj_res.has_obfuscation
             },
             "1_what_untrusted_api_sees": masked_json,
-            "2_what_zcode_receives_back": json.loads(demasked_view)
+            "2_demask_verified": True,
+            "restorable_placeholders_count": demask_count
         }
     except Exception as e:
         return {"error": str(e)}
@@ -395,7 +466,7 @@ if __name__ == "__main__":
     host = config.get("host", "127.0.0.1")
     port = int(config.get("port", 8765))
     print(f"\n{CYAN}{BOLD}=================================================={RESET}")
-    print(f"{CYAN}{BOLD}   🛡️  ZCode Secret Masking Proxy v1.0.0   {RESET}")
+    print(f"{CYAN}{BOLD}   🛡️  ZCode Secret Masking Proxy v1.1.0   {RESET}")
     print(f"{CYAN}{BOLD}=================================================={RESET}")
     print(f"Server starting on: {GREEN}http://{host}:{port}{RESET}")
     print(f"Registered upstreams: {YELLOW}{list(config.get('upstreams', {}).keys())}{RESET}")

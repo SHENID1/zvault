@@ -91,7 +91,7 @@ async def run_e2e_tests():
 
     # Configure proxy to point 'mock' upstream to our mock server on port 9999
     config["upstreams"]["mock"] = "http://127.0.0.1:9999/v1"
-    config["allowed_hosts"].append("127.0.0.1:9999")
+    config["allowed_hosts"].append("127.0.0.1")
 
     # Start mock upstream server
     server_config = uvicorn.Config(mock_app, host="127.0.0.1", port=9999, log_level="error")
@@ -103,7 +103,7 @@ async def run_e2e_tests():
 
     try:
         # Use httpx.AsyncClient with ASGI transport to talk directly to the proxy app
-        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy_app), base_url="http://testproxy") as client:
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=proxy_app), base_url="http://127.0.0.1:8765") as client:
             # 1. Test root status
             r = await client.get("/")
             assert r.status_code == 200

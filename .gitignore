@@ -6,5 +6,4 @@ err.txt
 *.log
 .env
 *.env
-
-
+secrets.json
