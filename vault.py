@@ -23,9 +23,9 @@ IGNORE_ENV_KEYS = {
     "PATH", "SHELL", "USER", "HOME", "HOSTNAME"
 }
 
-# Strictly narrowed system keys in LLM JSON payloads that should NOT be masked by entropy/regex
+# System keys in LLM JSON payloads that should NOT be masked by entropy/regex
 SYSTEM_SAFE_KEYS = {
-    "id", "tool_call_id", "call_id"
+    "id", "tool_call_id", "call_id", "signature", "encrypted_content"
 }
 
 
@@ -145,11 +145,9 @@ class SecretVault:
                 if content.startswith("{"):
                     data = json.loads(content)
                     for k, v in data.items():
-                        # Disallow booleans, integers, floats, None from becoming secrets!
                         if isinstance(v, bool):
                             continue
                         if isinstance(v, str) and v.strip():
-                            # Don't register "true", "false", "null"
                             if v.strip().lower() in ("true", "false", "null", "undefined"):
                                 continue
                             self.register_secret(v.strip(), str(k).strip())
@@ -162,10 +160,6 @@ class SecretVault:
             print(f"[Vault] Error loading secrets from {path}: {e}")
 
     def register_secret(self, secret: str, label: Optional[str] = None) -> str:
-        """
-        Registers a secret and returns its placeholder.
-        Supports exact custom placeholders (e.g. '__home_net__') or generates '__VAULT_{LABEL}_{ID}__'.
-        """
         if not secret or len(secret) < 3:
             return secret
 
@@ -173,7 +167,6 @@ class SecretVault:
             return self.secret_to_placeholder[secret]
 
         if label:
-            # If user explicitly passed an exact placeholder format like '__home_net__'
             if label.startswith("__") and label.endswith("__") and len(label) > 4:
                 clean_tag = re.sub(r"[^A-Za-z0-9_]", "_", label[2:-2])
                 placeholder = f"__{clean_tag}__"
@@ -183,7 +176,6 @@ class SecretVault:
         else:
             placeholder = f"__VAULT_SECRET_{self._next_id:02d}__"
 
-        # If placeholder name collides with an existing one for a DIFFERENT secret
         if placeholder in self.placeholder_to_secret:
             clean_base = placeholder.strip("_")
             placeholder = f"__{clean_base}_{self._next_id:02d}__"
@@ -232,10 +224,8 @@ class SecretVault:
         for token in potential_tokens:
             if token in self.secret_to_placeholder or token.startswith("__VAULT_"):
                 continue
-            # Skip system IDs and model names
             if any(token.startswith(pfx) for pfx in ("call_", "toolu_", "chatcmpl-", "msg_", "resp_", "ft:", "gpt-", "claude-")):
                 continue
-            # Must contain both letters and digits
             if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
                 if not token.startswith("http") and "/" not in token:
                     h = calculate_shannon_entropy(token)
@@ -299,7 +289,10 @@ class SecretVault:
         return masked, replacements
 
     def mask_payload(self, data: Any) -> Tuple[Any, int]:
-        """Recursively masks string values in a JSON-serializable structure."""
+        """
+        Recursively masks string values in a JSON-serializable structure.
+        Preserves thinking, redacted_thinking, reasoning, signature, and encrypted_content blocks intact.
+        """
         if isinstance(data, str):
             return self.mask_text(data)
         elif isinstance(data, list):
@@ -311,12 +304,23 @@ class SecretVault:
                 total_replacements += count
             return new_list, total_replacements
         elif isinstance(data, dict):
+            # Check for Anthropic thinking or OpenAI reasoning blocks
+            block_type = data.get("type")
+            is_thinking_block = block_type in ("thinking", "redacted_thinking") or "signature" in data or "encrypted_content" in data
+
             new_dict = {}
             total_replacements = 0
             for k, v in data.items():
+                # Never mask system identification, signatures, or encrypted content
                 if k in SYSTEM_SAFE_KEYS:
                     new_dict[k] = v
                     continue
+
+                # Never touch internal data/signature/thinking fields in thinking blocks
+                if is_thinking_block and k in ("thinking", "data", "signature", "encrypted_content", "summary"):
+                    new_dict[k] = v
+                    continue
+
                 masked_v, count = self.mask_payload(v)
                 new_dict[k] = masked_v
                 total_replacements += count
@@ -405,18 +409,12 @@ class TextStreamDemasker:
         last_double_underscore = self.buffer.rfind("__")
 
         if last_double_underscore == -1:
-            # No '__' at all: entire buffer is safe to emit immediately
             to_emit = self.buffer
             self.buffer = ""
             return to_emit
 
         tail = self.buffer[last_double_underscore:]
 
-        # A valid unclosed placeholder prefix MUST:
-        # 1. Start with '__'
-        # 2. Contain only alphanumeric chars and underscores (NO spaces, punctuation, etc.)
-        # 3. Not have a closing '__' after the first 2 characters
-        # 4. Be shorter than max_placeholder_len
         is_candidate_prefix = (
             re.match(r"^__[A-Za-z0-9_]*$", tail) is not None
             and tail[2:].find("__") == -1
@@ -428,7 +426,6 @@ class TextStreamDemasker:
             self.buffer = tail
             return to_emit
 
-        # Otherwise, the tail is NOT an unclosed placeholder (e.g. '__ now' or complete word)
         to_emit = self.buffer
         self.buffer = ""
         return to_emit
@@ -443,7 +440,7 @@ class SSEStreamDemasker:
     """
     Universal Demasker for Server-Sent Events (SSE).
     Supports OpenAI Chat Completions, Responses API, Anthropic, and streaming tool calls.
-    Flushes buffers proactively on finish_reason, content_block_stop, and [DONE].
+    Flushes buffers proactively on finish_reason, content_block_stop, response.output_text.done, and [DONE].
     """
     def __init__(self, vault: SecretVault):
         self.vault = vault
@@ -498,6 +495,38 @@ class SSEStreamDemasker:
                                 event_data["delta"] = self.content_demasker.process(event_data["delta"])
                             self.last_responses_event = dict(event_data)
                             modified = True
+
+                        # Responses API: proactively flush buffers on completion events before sending them
+                        elif ev_type in (
+                            "response.output_text.done",
+                            "response.content_part.done",
+                            "response.completed",
+                            "response.done",
+                        ):
+                            flushed_c = self.content_demasker.flush()
+                            if flushed_c:
+                                synth = {
+                                    "type": "response.output_text.delta",
+                                    "delta": flushed_c
+                                }
+                                if self.last_responses_event:
+                                    for k in ("item_id", "output_index", "content_index"):
+                                        if k in self.last_responses_event:
+                                            synth[k] = self.last_responses_event[k]
+                                output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+
+                        elif ev_type == "response.function_call_arguments.done":
+                            call_id = event_data.get("call_id", "default")
+                            key = f"resp_fn_{call_id}"
+                            if key in self.stream_demaskers:
+                                flushed_fn = self.stream_demaskers[key].flush()
+                                if flushed_fn:
+                                    synth = {
+                                        "type": "response.function_call_arguments.delta",
+                                        "call_id": call_id,
+                                        "delta": flushed_fn
+                                    }
+                                    output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
 
                         # 2. OpenAI Chat Completions (choices -> delta)
                         elif "choices" in event_data and isinstance(event_data["choices"], list):
@@ -611,6 +640,14 @@ class SSEStreamDemasker:
                     c_idx = int(parts[2]) if len(parts) > 2 else 0
                     t_idx = int(parts[3]) if len(parts) > 3 else 0
                     synth = {"choices": [{"index": c_idx, "delta": {"tool_calls": [{"index": t_idx, "function": {"arguments": flushed_extra}}]}}]}
+                    output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+                elif key.startswith("resp_fn_"):
+                    call_id = key.split("resp_fn_")[-1]
+                    synth = {
+                        "type": "response.function_call_arguments.delta",
+                        "call_id": call_id,
+                        "delta": flushed_extra
+                    }
                     output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
 
         self.stream_demaskers.clear()

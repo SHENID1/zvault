@@ -69,12 +69,12 @@ if os.path.exists(CONFIG_FILE):
 def get_or_generate_vault_token() -> str:
     """
     Retrieves or generates a secure random vault token.
-    Token is stored in .vault_token (git-ignored) with chmod 600.
+    Priority:
+    1. .vault_token file (git-ignored, 0o600)
+    2. config.json ("vault_token")
+    3. Generate new random token and save to .vault_token with 0o600 atomically.
     """
-    token = config.get("vault_token")
-    if token and not token.startswith("zvault_sec_local_d98f"):
-        return token
-
+    # 1. Check .vault_token
     if os.path.exists(TOKEN_FILE):
         try:
             with open(TOKEN_FILE, "r", encoding="utf-8") as f:
@@ -84,16 +84,23 @@ def get_or_generate_vault_token() -> str:
         except Exception:
             pass
 
-    # Generate a strong unique token
+    # 2. Check config.json
+    cfg_token = config.get("vault_token")
+    if cfg_token and not cfg_token.startswith("zvault_sec_local_d98f"):
+        return cfg_token
+
+    # 3. Generate a strong unique token and create file with 0o600 atomically
     new_token = f"zv_{secrets.token_hex(24)}"
     try:
-        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-            f.write(new_token)
-        if hasattr(os, "chmod") and sys.platform != "win32":
-            try:
-                os.chmod(TOKEN_FILE, 0o600)
-            except Exception:
-                pass
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+        mode = 0o600
+        if sys.platform != "win32":
+            fd = os.open(TOKEN_FILE, flags, mode)
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(new_token)
+        else:
+            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+                f.write(new_token)
     except Exception as e:
         print(f"[WARN] Failed to write .vault_token file: {e}")
 

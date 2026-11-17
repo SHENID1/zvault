@@ -82,7 +82,7 @@ class PromptInjectionGuard:
             (r"(?i)\bpowershell(?:\.exe)?\s+-[eE]nc(?:odedcommand)?\b", "ENCODED_POWERSHELL"),
         ]
 
-        # 7. Download & exec patterns (weight 0.55 so documentation examples in README don't trigger alone)
+        # 7. Download & exec patterns (locally contextualized to avoid false positives in code fences/docs)
         self.download_exec_patterns = [
             (r"(?i)\b(?:invoke-webrequest|iwr|curl|wget)\b[\s\S]{0,60}\|\s*(?:iex|sh|bash)\b", "MALICIOUS_DOWNLOAD_EXEC"),
         ]
@@ -138,7 +138,7 @@ class PromptInjectionGuard:
                 matched.append(tag)
                 highest_category = tag
 
-        # 2. Scan text against pattern groups with balanced weights
+        # 2. Scan text against pattern groups
         pattern_groups = [
             (self.destructive_shell_patterns, 0.85),
             (self.override_patterns, 0.75),
@@ -158,13 +158,22 @@ class PromptInjectionGuard:
                     if not highest_category:
                         highest_category = label
 
-        # Download & execute: distinguish direct execution vs markdown code block / documentation example
+        # Download & execute: LOCAL context check (checks if match itself is enclosed in code fence or preceded by doc words)
         for pattern, label in self.download_exec_patterns:
-            if (re.search(pattern, text) or
-                re.search(pattern, normalized_text) or
-                re.search(pattern, latin_text)):
+            for m in re.finditer(pattern, text):
                 matched.append(label)
-                is_doc_example = bool(re.search(r"```|(?:install|setup|usage|readme|example|docker|guide)[\s\S]{0,40}(?:curl|wget)", text, re.IGNORECASE))
+                start_idx = m.start()
+
+                # Check if this specific match is inside a markdown code block (odd number of fences before it)
+                preceding_text = text[:start_idx]
+                fences_before = preceding_text.count("```")
+                inside_code_block = (fences_before % 2 == 1)
+
+                # Check if directly preceded by install/documentation words within 60 chars
+                preceding_slice = preceding_text[max(0, start_idx - 60):]
+                is_doc_preceded = bool(re.search(r"(?i)\b(?:install(?:ation)?|setup|usage|readme|example|docker(?:file)?|guide)\b", preceding_slice))
+
+                is_doc_example = inside_code_block or is_doc_preceded
                 weight = 0.50 if is_doc_example else 0.70
                 base_score = max(base_score, weight)
                 if not highest_category:
@@ -188,10 +197,10 @@ class PromptInjectionGuard:
     def scan_payload(self, body_json: Any) -> InjectionResult:
         """
         Deep-scans an entire LLM request payload:
-        - Chat completions (messages)
+        - Chat completions (messages) with sliding turn window
         - Anthropic top-level 'system' prompt
-        - OpenAI / Anthropic 'tools' definitions
-        - Responses API top-level 'input' and 'function_call_output'
+        - OpenAI / Anthropic 'tools' definitions (including all parameter & property descriptions)
+        - Responses API top-level 'input' with sliding turn window
         """
         combined_text = []
 
@@ -205,21 +214,34 @@ class PromptInjectionGuard:
                     if isinstance(item, dict) and "text" in item:
                         combined_text.append(str(item["text"]))
 
-            # 2. Top-level tools definitions
+            # 2. Top-level tools definitions: recursively scan ALL descriptions (including parameters / properties)
             tools = body_json.get("tools")
             if isinstance(tools, list):
-                for t in tools:
-                    if isinstance(t, dict):
-                        func = t.get("function", t)
-                        if "description" in func:
-                            combined_text.append(str(func["description"]))
+                def extract_descriptions(obj: Any):
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            if k == "description" and isinstance(v, str):
+                                combined_text.append(v)
+                            else:
+                                extract_descriptions(v)
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            extract_descriptions(item)
 
-            # 3. Responses API top-level input array (containing function_call_output)
+                for t in tools:
+                    extract_descriptions(t)
+
+            # 3. Responses API top-level input array: sliding turn window after last assistant turn
             input_data = body_json.get("input")
             if isinstance(input_data, list):
-                for item in input_data:
+                last_asst_idx = -1
+                for idx, item in enumerate(input_data):
+                    if isinstance(item, dict) and (item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant")):
+                        last_asst_idx = idx
+
+                untrusted_input = input_data[last_asst_idx + 1:] if last_asst_idx != -1 else input_data
+                for item in untrusted_input:
                     if isinstance(item, dict):
-                        # function_call_output items
                         if "output" in item:
                             combined_text.append(str(item["output"]))
                         if "content" in item:
@@ -235,7 +257,7 @@ class PromptInjectionGuard:
             elif isinstance(input_data, str):
                 combined_text.append(input_data)
 
-            # 4. Messages list (Chat completions)
+            # 4. Messages list (Chat completions): sliding turn window after last assistant turn
             messages = body_json.get("messages")
             if isinstance(messages, list):
                 last_assistant_idx = -1
@@ -280,7 +302,6 @@ class PromptInjectionGuard:
         return self.scan_text(full_content)
 
     def scan_messages(self, messages: Any) -> InjectionResult:
-        """Backward-compatible wrapper for scan_payload."""
         if isinstance(messages, dict):
             return self.scan_payload(messages)
         return self.scan_payload({"messages": messages})
