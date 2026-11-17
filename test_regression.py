@@ -314,6 +314,109 @@ class TestZVaultRegression(unittest.TestCase):
         res = guard.scan_payload(payload)
         self.assertFalse(res.is_malicious)
 
+    # --- 8. Thinking & Reasoning Roundtrip Invariant ---
+    def test_thinking_reasoning_cycle_invariant_no_leak(self):
+        """
+        CRITICAL INVARIANT TEST:
+        After full cycle:
+        Upstream (emits placeholder in thinking) -> Proxy demask -> Client -> Next request -> Proxy mask
+        Verifies:
+        1. Thinking/reasoning blocks are NEVER demasked on ingress (remain placeholders).
+        2. Normal content blocks ARE demasked for client.
+        3. On the subsequent request, when client sends previous assistant thinking block back,
+           NO real secrets are present in the outbound payload sent to untrusted upstream!
+        4. Signatures remain byte-for-byte identical.
+        """
+        vault = SecretVault()
+        real_key = "sk-live-confidential-secret-key-1234567890abcdef"
+        ph = vault.register_secret(real_key, "API_KEY")
+
+        # Case A: OpenAI reasoning_content
+        upstream_openai_resp = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": f"I will use {ph} to authorize query",
+                        "content": f"The key is {ph}"
+                    }
+                }
+            ]
+        }
+
+        # 1. Inbound demasking
+        demasked_resp, _ = vault.demask_payload(upstream_openai_resp)
+        asst_msg = demasked_resp["choices"][0]["message"]
+
+        # Invariant check 1: reasoning_content still has placeholder, NOT real key!
+        self.assertEqual(asst_msg["reasoning_content"], f"I will use {ph} to authorize query")
+        self.assertNotIn(real_key, asst_msg["reasoning_content"])
+
+        # Content DOES have real key
+        self.assertEqual(asst_msg["content"], f"The key is {real_key}")
+
+        # 2. Next request cycle (client includes assistant turn in history)
+        next_request = {
+            "messages": [
+                asst_msg,
+                {"role": "user", "content": "Confirm you executed it"}
+            ]
+        }
+
+        # 3. Outbound masking
+        masked_outbound, _ = vault.mask_payload(next_request)
+        outbound_str = json.dumps(masked_outbound)
+
+        # Invariant check 2: ZERO real secrets in the outbound request body!
+        self.assertNotIn(real_key, outbound_str)
+        self.assertIn(ph, outbound_str)
+
+        # Case B: Anthropic thinking block with signature
+        original_signature = "eA8kZ1q9XmK4pL7vT3wY2uR6oN8bV0sD5jF1gH9cE3a="
+        upstream_anthropic_resp = {
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": f"Calling backend with {ph}",
+                    "signature": original_signature
+                },
+                {
+                    "type": "text",
+                    "text": f"Connected with {ph}"
+                }
+            ]
+        }
+
+        # 1. Inbound demasking
+        demasked_anthropic, _ = vault.demask_payload(upstream_anthropic_resp)
+        thinking_block = demasked_anthropic["content"][0]
+        text_block = demasked_anthropic["content"][1]
+
+        # Thinking block must keep placeholder, signature must be unchanged
+        self.assertEqual(thinking_block["thinking"], f"Calling backend with {ph}")
+        self.assertNotIn(real_key, thinking_block["thinking"])
+        self.assertEqual(thinking_block["signature"], original_signature)
+
+        # Text block has real key
+        self.assertEqual(text_block["text"], f"Connected with {real_key}")
+
+        # 2. Next turn
+        next_anthropic_req = {
+            "messages": [
+                {"role": "assistant", "content": demasked_anthropic["content"]},
+                {"role": "user", "content": "Continue execution"}
+            ]
+        }
+
+        # 3. Outbound masking
+        masked_anthropic_outbound, _ = vault.mask_payload(next_anthropic_req)
+        outbound_anthropic_str = json.dumps(masked_anthropic_outbound)
+
+        # Invariant check: ZERO real secrets in outbound request!
+        self.assertNotIn(real_key, outbound_anthropic_str)
+        self.assertIn(ph, outbound_anthropic_str)
+        self.assertIn(original_signature, outbound_anthropic_str)
+
 
 if __name__ == "__main__":
     unittest.main()

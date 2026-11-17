@@ -28,6 +28,17 @@ SYSTEM_SAFE_KEYS = {
     "id", "tool_call_id", "call_id", "signature", "encrypted_content"
 }
 
+# Thinking and reasoning fields that must NEVER be masked on egress OR demasked on ingress
+# Ensuring exact symmetry prevents secret leakage and preserves cryptographic signatures.
+THINKING_REASONING_KEYS = {
+    "thinking", "redacted_thinking", "signature", "encrypted_content",
+    "reasoning", "reasoning_content", "summary", "data"
+}
+
+THINKING_BLOCK_TYPES = {
+    "thinking", "redacted_thinking", "reasoning"
+}
+
 
 class SecretVault:
     def __init__(self, secrets_file: Optional[str] = None, env_files: Optional[List[str]] = None):
@@ -112,16 +123,12 @@ class SecretVault:
                         key = key.strip()
                         val = val.strip().strip("\"'").strip()
 
-                        # Skip non-sensitive keys
                         if key.upper() in IGNORE_ENV_KEYS:
                             continue
-                        # Skip booleans and nulls
                         if val.lower() in ("true", "false", "null", "undefined", "yes", "no"):
                             continue
-                        # Skip short port numbers or single digits
                         if val.isdigit() and len(val) < 8:
                             continue
-                        # Only mask meaningful values >= 5 chars
                         if len(val) >= 5:
                             self.register_secret(val, key)
                             loaded += 1
@@ -291,7 +298,7 @@ class SecretVault:
     def mask_payload(self, data: Any) -> Tuple[Any, int]:
         """
         Recursively masks string values in a JSON-serializable structure.
-        Preserves thinking, redacted_thinking, reasoning, signature, and encrypted_content blocks intact.
+        Preserves thinking, reasoning, signature, data, and encrypted_content blocks intact.
         """
         if isinstance(data, str):
             return self.mask_text(data)
@@ -304,20 +311,18 @@ class SecretVault:
                 total_replacements += count
             return new_list, total_replacements
         elif isinstance(data, dict):
-            # Check for Anthropic thinking or OpenAI reasoning blocks
             block_type = data.get("type")
-            is_thinking_block = block_type in ("thinking", "redacted_thinking") or "signature" in data or "encrypted_content" in data
+            is_thinking_block = block_type in THINKING_BLOCK_TYPES or "signature" in data or "encrypted_content" in data
 
             new_dict = {}
             total_replacements = 0
             for k, v in data.items():
-                # Never mask system identification, signatures, or encrypted content
                 if k in SYSTEM_SAFE_KEYS:
                     new_dict[k] = v
                     continue
 
-                # Never touch internal data/signature/thinking fields in thinking blocks
-                if is_thinking_block and k in ("thinking", "data", "signature", "encrypted_content", "summary"):
+                # Never touch internal data/signature/thinking fields
+                if is_thinking_block or k in THINKING_REASONING_KEYS:
                     new_dict[k] = v
                     continue
 
@@ -352,7 +357,12 @@ class SecretVault:
         return result, restorations
 
     def demask_payload(self, data: Any) -> Tuple[Any, int]:
-        """Recursively demasks string values in a JSON-serializable structure (dicts/lists)."""
+        """
+        Recursively demasks string values in a JSON-serializable structure.
+        Maintains symmetry: strictly NEVER demasks thinking, reasoning, signature, or summary fields!
+        This guarantees that thinking blocks returning from LLM remain byte-for-byte identical,
+        preserving cryptographic signatures and preventing secrets from leaking on the next conversation turn.
+        """
         if isinstance(data, str):
             return self.demask_text(data)
         elif isinstance(data, list):
@@ -364,9 +374,17 @@ class SecretVault:
                 total_restorations += count
             return new_list, total_restorations
         elif isinstance(data, dict):
+            block_type = data.get("type")
+            is_thinking_block = block_type in THINKING_BLOCK_TYPES or "signature" in data or "encrypted_content" in data
+
             new_dict = {}
             total_restorations = 0
             for k, v in data.items():
+                # Strictly preserve thinking, signatures, reasoning, summaries, and encrypted content
+                if is_thinking_block or k in THINKING_REASONING_KEYS:
+                    new_dict[k] = v
+                    continue
+
                 demasked_v, count = self.demask_payload(v)
                 new_dict[k] = demasked_v
                 total_restorations += count
@@ -441,12 +459,12 @@ class SSEStreamDemasker:
     Universal Demasker for Server-Sent Events (SSE).
     Supports OpenAI Chat Completions, Responses API, Anthropic, and streaming tool calls.
     Flushes buffers proactively on finish_reason, content_block_stop, response.output_text.done, and [DONE].
+    NEVER demasks thinking, reasoning, or signature events in the stream.
     """
     def __init__(self, vault: SecretVault):
         self.vault = vault
         self.raw_line_buffer = ""
         self.content_demasker = TextStreamDemasker(vault, json_escaped=False)
-        self.reasoning_demasker = TextStreamDemasker(vault, json_escaped=False)
         self.stream_demaskers: Dict[str, TextStreamDemasker] = {}
         self.last_responses_event: Optional[Dict[str, Any]] = None
         self.saw_choices: bool = False
@@ -485,8 +503,16 @@ class SSEStreamDemasker:
                     if isinstance(event_data, dict):
                         ev_type = event_data.get("type", "")
 
-                        # 1. OpenAI Responses API
-                        if "delta" in event_data and isinstance(event_data["delta"], str):
+                        # Responses API reasoning events: NEVER demask (preserve placeholders intact)
+                        if ev_type in (
+                            "response.reasoning_text.delta",
+                            "response.reasoning_summary_text.delta",
+                            "response.reasoning.delta"
+                        ):
+                            modified = True
+
+                        # 1. OpenAI Responses API text output
+                        elif "delta" in event_data and isinstance(event_data["delta"], str):
                             if ev_type == "response.function_call_arguments.delta":
                                 call_id = event_data.get("call_id", "default")
                                 demasker = self._get_stream_demasker(f"resp_fn_{call_id}", json_escaped=True)
@@ -540,9 +566,11 @@ class SSEStreamDemasker:
                                     if "content" in delta and isinstance(delta["content"], str):
                                         delta["content"] = self.content_demasker.process(delta["content"])
                                         modified = True
-                                    if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
-                                        delta["reasoning_content"] = self.reasoning_demasker.process(delta["reasoning_content"])
+
+                                    # DO NOT demask reasoning_content: keep placeholders intact
+                                    if "reasoning_content" in delta:
                                         modified = True
+
                                     if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
                                         for tc in delta["tool_calls"]:
                                             tc_idx = tc.get("index", 0)
@@ -566,11 +594,17 @@ class SSEStreamDemasker:
                         # 3. Anthropic format
                         elif "delta" in event_data and isinstance(event_data["delta"], dict):
                             delta_obj = event_data["delta"]
+                            d_type = delta_obj.get("type", "")
                             block_idx = event_data.get("index", 0)
-                            if "text" in delta_obj and isinstance(delta_obj["text"], str):
+
+                            # Anthropic thinking / signature deltas: NEVER demask
+                            if d_type in ("thinking_delta", "signature_delta"):
+                                modified = True
+
+                            elif "text" in delta_obj and isinstance(delta_obj["text"], str):
                                 delta_obj["text"] = self.content_demasker.process(delta_obj["text"])
                                 modified = True
-                            if "partial_json" in delta_obj and isinstance(delta_obj["partial_json"], str):
+                            elif "partial_json" in delta_obj and isinstance(delta_obj["partial_json"], str):
                                 key = f"anthropic_block_{block_idx}"
                                 tc_demasker = self._get_stream_demasker(key, json_escaped=True)
                                 delta_obj["partial_json"] = tc_demasker.process(delta_obj["partial_json"])
