@@ -28,16 +28,29 @@ SYSTEM_SAFE_KEYS = {
     "id", "tool_call_id", "call_id", "signature", "encrypted_content"
 }
 
-# Thinking and reasoning fields that must NEVER be masked on egress OR demasked on ingress
-# Ensuring exact symmetry prevents secret leakage and preserves cryptographic signatures.
-THINKING_REASONING_KEYS = {
-    "thinking", "redacted_thinking", "signature", "encrypted_content",
-    "reasoning", "reasoning_content", "summary", "data"
-}
-
+# Thinking / reasoning blocks must be neither masked on egress nor demasked on ingress.
+# Symmetry keeps the block byte-for-byte identical to what the upstream produced:
+# signatures stay valid and no real secret can leak back on the next turn.
+# Scope is deliberately narrow: a block is recognised ONLY by its "type", and only
+# its own opaque fields are skipped. Generic keys such as "data" or "summary" in
+# ordinary dicts (e.g. tool_use.input) are processed like any other data.
 THINKING_BLOCK_TYPES = {
     "thinking", "redacted_thinking", "reasoning"
 }
+
+THINKING_BLOCK_KEYS = {
+    "thinking", "data", "signature", "encrypted_content", "summary", "content"
+}
+
+
+def _skip_symmetric(node: Dict[str, Any], key: str) -> bool:
+    """True if `key` of dict `node` must pass through mask/demask untouched."""
+    if node.get("type") in THINKING_BLOCK_TYPES and key in THINKING_BLOCK_KEYS:
+        return True
+    # Chat Completions assistant message carrying provider reasoning text
+    if key == "reasoning_content" and "role" in node:
+        return True
+    return False
 
 
 class SecretVault:
@@ -298,7 +311,7 @@ class SecretVault:
     def mask_payload(self, data: Any) -> Tuple[Any, int]:
         """
         Recursively masks string values in a JSON-serializable structure.
-        Preserves thinking, reasoning, signature, data, and encrypted_content blocks intact.
+        Thinking/reasoning blocks (matched by `type`) are passed through intact; see _skip_symmetric.
         """
         if isinstance(data, str):
             return self.mask_text(data)
@@ -311,18 +324,10 @@ class SecretVault:
                 total_replacements += count
             return new_list, total_replacements
         elif isinstance(data, dict):
-            block_type = data.get("type")
-            is_thinking_block = block_type in THINKING_BLOCK_TYPES or "signature" in data or "encrypted_content" in data
-
             new_dict = {}
             total_replacements = 0
             for k, v in data.items():
-                if k in SYSTEM_SAFE_KEYS:
-                    new_dict[k] = v
-                    continue
-
-                # Never touch internal data/signature/thinking fields
-                if is_thinking_block or k in THINKING_REASONING_KEYS:
+                if k in SYSTEM_SAFE_KEYS or _skip_symmetric(data, k):
                     new_dict[k] = v
                     continue
 
@@ -359,7 +364,7 @@ class SecretVault:
     def demask_payload(self, data: Any) -> Tuple[Any, int]:
         """
         Recursively demasks string values in a JSON-serializable structure.
-        Maintains symmetry: strictly NEVER demasks thinking, reasoning, signature, or summary fields!
+        Maintains symmetry with mask_payload: thinking/reasoning blocks (matched by `type`) are never demasked.
         This guarantees that thinking blocks returning from LLM remain byte-for-byte identical,
         preserving cryptographic signatures and preventing secrets from leaking on the next conversation turn.
         """
@@ -374,14 +379,10 @@ class SecretVault:
                 total_restorations += count
             return new_list, total_restorations
         elif isinstance(data, dict):
-            block_type = data.get("type")
-            is_thinking_block = block_type in THINKING_BLOCK_TYPES or "signature" in data or "encrypted_content" in data
-
             new_dict = {}
             total_restorations = 0
             for k, v in data.items():
-                # Strictly preserve thinking, signatures, reasoning, summaries, and encrypted content
-                if is_thinking_block or k in THINKING_REASONING_KEYS:
+                if _skip_symmetric(data, k):
                     new_dict[k] = v
                     continue
 
