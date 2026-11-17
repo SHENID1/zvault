@@ -5,6 +5,7 @@ import sys
 import time
 import math
 import secrets
+import threading
 import ipaddress
 from collections import Counter
 from typing import Dict, List, Tuple, Any, Optional, Callable
@@ -39,6 +40,18 @@ DUMMY_VALUES = {
     "todo", "secret", "password", "tokenizer", "gpt2-tokenizer", "test", "demo",
     "sample", "placeholder", "xxx", "xxxx", "null", "none", "undefined"
 }
+
+# Variable name suffixes and prefixes to ignore in contextual assignment scanning
+# Prevents false-positives for parameter names, types, field names, selectors, and URLs
+NON_SECRET_VAR_SUFFIXES = (
+    "name", "type", "field", "url", "path", "header",
+    "class", "selector", "tag", "param", "schema",
+    "_name", "_type", "_field", "_url", "_path", "_header",
+    "_class", "_selector", "_tag", "_param", "_schema", "_key_name"
+)
+NON_SECRET_VAR_PREFIXES = (
+    "public_", "next_public_", "default_type"
+)
 
 # JSON-inside-string keys in LLM tool calling payloads
 JSON_STRING_KEYS = {
@@ -83,6 +96,7 @@ class SecretVault:
         self.state_file = state_file
         self.state_ttl = state_ttl
         self.session_nonce = session_nonce or secrets.token_hex(3)
+        self._state_lock = threading.Lock()
         self.secret_to_placeholder: Dict[str, str] = {}
         self.placeholder_to_secret: Dict[str, str] = {}
         self.dynamic_secrets: Dict[str, Dict[str, Any]] = {}
@@ -124,8 +138,10 @@ class SecretVault:
         ]
 
         # IPv4 pattern (with optional CIDR prefix e.g. /24)
+        # Lookarounds prevent matching substrings of OIDs (e.g. 1.3.6.1.4.1) or multi-part versions
+        # while permitting punctuation like trailing sentence periods
         self.ipv4_pattern = re.compile(
-            r"\b((?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\/\d{1,2})?)\b"
+            r"(?<![0-9])(?<![0-9]\.)((?:(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])(?:\/\d{1,2})?)(?![0-9])(?!\.[0-9])"
         )
         self.ipv4_exempt = {"127.0.0.1", "0.0.0.0", "255.255.255.255", "1.1.1.1", "8.8.8.8", "8.8.4.4"}
 
@@ -188,6 +204,8 @@ class SecretVault:
                             continue
                         if val.lower() in IGNORE_ENV_VALUES:
                             continue
+                        if val.lower() in DUMMY_VALUES:
+                            continue
                         if val.isdigit() and len(val) < 8:
                             continue
                         if len(val) >= 5:
@@ -216,16 +234,39 @@ class SecretVault:
                         if isinstance(v, bool):
                             continue
                         if isinstance(v, str) and v.strip():
-                            if v.strip().lower() in ("true", "false", "null", "undefined"):
+                            val_clean = v.strip().lower()
+                            if val_clean in ("true", "false", "null", "undefined") or val_clean in DUMMY_VALUES or val_clean in IGNORE_ENV_VALUES:
                                 continue
                             self.register_secret(v.strip(), str(k).strip())
                 else:
                     for line in content.splitlines():
                         line = line.strip()
                         if line and not line.startswith("#"):
-                            self.register_secret(line)
+                            if line.lower() not in DUMMY_VALUES and line.lower() not in IGNORE_ENV_VALUES:
+                                self.register_secret(line)
         except Exception as e:
             print(f"[Vault] Error loading secrets from {path}: {e}")
+
+    def cleanup_expired(self) -> int:
+        """Purges dynamic secrets older than state_ttl from memory and caches."""
+        if self.state_ttl <= 0 or not self.dynamic_secrets:
+            return 0
+        now = time.time()
+        expired = [
+            ph for ph, info in self.dynamic_secrets.items()
+            if (now - float(info.get("ts", 0))) > self.state_ttl
+        ]
+        for ph in expired:
+            secret = self.placeholder_to_secret.pop(ph, None)
+            if secret and secret in self.secret_to_placeholder:
+                del self.secret_to_placeholder[secret]
+            del self.dynamic_secrets[ph]
+
+        if expired:
+            self._invalidate_regex_cache()
+            if self.state_file:
+                self.save_state()
+        return len(expired)
 
     def load_state(self):
         """Loads dynamically registered secrets from state_file, discarding expired entries and preventing collisions."""
@@ -294,24 +335,25 @@ class SecretVault:
         """Persists dynamic secret mappings to state_file atomically with 0o600 permissions."""
         if not self.state_file or not self.dynamic_secrets:
             return
-        try:
-            tmp_path = f"{self.state_file}.tmp_{os.getpid()}"
-            payload = {
-                "session_nonce": self.session_nonce,
-                "secrets": self.dynamic_secrets
-            }
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+        with self._state_lock:
+            try:
+                tmp_path = f"{self.state_file}.tmp_{os.getpid()}_{time.time_ns()}"
+                payload = {
+                    "session_nonce": self.session_nonce,
+                    "secrets": self.dynamic_secrets
+                }
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2, ensure_ascii=False)
 
-            if hasattr(os, "chmod") and sys.platform != "win32":
-                try:
-                    os.chmod(tmp_path, 0o600)
-                except Exception:
-                    pass
+                if hasattr(os, "chmod") and sys.platform != "win32":
+                    try:
+                        os.chmod(tmp_path, 0o600)
+                    except Exception:
+                        pass
 
-            os.replace(tmp_path, self.state_file)
-        except Exception as e:
-            print(f"[Vault] Error saving state file: {e}")
+                os.replace(tmp_path, self.state_file)
+            except Exception as e:
+                print(f"[Vault] Error saving state file: {e}")
 
     def register_secret(self, secret: str, label: Optional[str] = None, is_dynamic: bool = False) -> str:
         if not secret or len(secret) < 3:
@@ -359,6 +401,11 @@ class SecretVault:
         for m in self.assignment_pattern.finditer(text):
             var_name = m.group(1)
             val = m.group(2)
+            var_lower = var_name.lower()
+            if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
+                continue
+            if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
+                continue
             if val and val.strip().lower() in DUMMY_VALUES:
                 continue
             if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
@@ -369,6 +416,11 @@ class SecretVault:
         for m in self.yaml_assignment_pattern.finditer(text):
             var_name = m.group(1)
             val = m.group(2)
+            var_lower = var_name.lower()
+            if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
+                continue
+            if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
+                continue
             if val and val.strip().lower() in DUMMY_VALUES:
                 continue
             if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
@@ -386,7 +438,10 @@ class SecretVault:
         for m in self.env_pattern.finditer(text):
             var_name = m.group(1)
             val = m.group(2)
-            if val and val.strip().lower() in DUMMY_VALUES:
+            var_lower = var_name.lower()
+            if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
+                continue
+            if val and (val.strip().lower() in DUMMY_VALUES or val.strip().lower() in IGNORE_ENV_VALUES):
                 continue
             if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
                 ph = self.register_secret(val, var_name, is_dynamic=True)
@@ -802,6 +857,31 @@ class SSEStreamDemasker:
                                             choice.setdefault("delta", {})["content"] = flushed_c
                                         modified = True
 
+                                    # Proactively flush tool_calls stream demaskers for this choice index
+                                    prefix = f"openai_tc_{c_idx}_"
+                                    for key in list(self.stream_demaskers.keys()):
+                                        if key.startswith(prefix):
+                                            flushed_tc = self.stream_demaskers[key].flush()
+                                            if flushed_tc:
+                                                try:
+                                                    t_idx = int(key[len(prefix):])
+                                                except ValueError:
+                                                    t_idx = 0
+                                                tc_list = choice.setdefault("delta", {}).setdefault("tool_calls", [])
+                                                matched = False
+                                                for existing_tc in tc_list:
+                                                    if existing_tc.get("index") == t_idx:
+                                                        func = existing_tc.setdefault("function", {})
+                                                        func["arguments"] = (func.get("arguments") or "") + flushed_tc
+                                                        matched = True
+                                                        break
+                                                if not matched:
+                                                    tc_list.append({
+                                                        "index": t_idx,
+                                                        "function": {"arguments": flushed_tc}
+                                                    })
+                                                modified = True
+
                         # 3. Anthropic format
                         elif "delta" in event_data and isinstance(event_data["delta"], dict):
                             delta_obj = event_data["delta"]
@@ -847,7 +927,7 @@ class SSEStreamDemasker:
                     if not modified and isinstance(event_data, (dict, list)):
                         event_data, _ = self.vault.demask_payload(event_data)
 
-                    output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n")
+                    output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n")
 
                 except Exception:
                     demasked_line, _ = self.vault.demask_text(line)

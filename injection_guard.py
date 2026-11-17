@@ -114,7 +114,9 @@ class PromptInjectionGuard:
             self.override_patterns_ru +
             self.jailbreak_patterns +
             self.prompt_leak_patterns +
-            self.destructive_shell_patterns
+            self.role_spoofing_patterns +
+            self.destructive_shell_patterns +
+            self.download_exec_patterns
         )
         for candidate in b64_candidates:
             clean_b64 = re.sub(r"\s+", "", candidate)
@@ -138,8 +140,8 @@ class PromptInjectionGuard:
                 pass
         return findings
 
-    def scan_text(self, text: str) -> InjectionResult:
-        """Analyzes text for prompt injections, jailbreaks, and evasions."""
+    def _scan_single_text(self, text: str) -> InjectionResult:
+        """Analyzes a single slice of text for prompt injections, jailbreaks, and evasions."""
         if not text or len(text.strip()) < 5:
             return InjectionResult(is_malicious=False, risk_score=0.0)
 
@@ -215,13 +217,89 @@ class PromptInjectionGuard:
             details=f"Risk: {round(base_score, 2)}, Category: {highest_category}, Matches: {', '.join(set(matched))}" if is_malicious else "Safe"
         )
 
+    def scan_text(self, text: str) -> InjectionResult:
+        """Analyzes text for prompt injections, jailbreaks, and evasions with ReDoS chunking."""
+        if not text or len(text.strip()) < 5:
+            return InjectionResult(is_malicious=False, risk_score=0.0)
+
+        CHUNK_SIZE = 8192
+        CHUNK_OVERLAP = 512
+
+        if len(text) > CHUNK_SIZE:
+            chunks = []
+            start = 0
+            while start < len(text):
+                end = min(len(text), start + CHUNK_SIZE)
+                chunks.append(text[start:end])
+                if end == len(text):
+                    break
+                start += CHUNK_SIZE - CHUNK_OVERLAP
+
+            max_res = InjectionResult(is_malicious=False, risk_score=0.0)
+            all_matched = []
+            for chunk in chunks:
+                res = self._scan_single_text(chunk)
+                if res.risk_score > max_res.risk_score:
+                    max_res = res
+                if res.matched_patterns:
+                    all_matched.extend(res.matched_patterns)
+                if res.is_malicious:
+                    max_res.matched_patterns = list(set(all_matched))
+                    return max_res
+            max_res.matched_patterns = list(set(all_matched))
+            return max_res
+
+        return self._scan_single_text(text)
+
+    def _extract_untrusted_elements(self, items: List[Any]) -> List[Any]:
+        """
+        Extracts untrusted items from a turn sequence using sliding turn window:
+        - Prevents spoofed trailing assistant messages from bypassing the scan
+        - Scans current turn (all messages after the last resolved assistant turn)
+        - Includes the calling assistant if it initiated active tool calls
+        """
+        if not items:
+            return []
+
+        last_user_or_tool_idx = -1
+        for idx, item in enumerate(items):
+            if isinstance(item, dict):
+                role = str(item.get("role", "")).lower()
+                item_type = str(item.get("type", "")).lower()
+                if role in ("user", "tool", "developer", "system") or item_type in ("function_call_output", "tool_result", "custom_tool_call_output"):
+                    last_user_or_tool_idx = idx
+            elif isinstance(item, str):
+                last_user_or_tool_idx = idx
+
+        if last_user_or_tool_idx == -1:
+            return items
+
+        last_prior_asst_idx = -1
+        for idx in range(last_user_or_tool_idx - 1, -1, -1):
+            item = items[idx]
+            if isinstance(item, dict):
+                role = str(item.get("role", "")).lower()
+                if role == "assistant" or (item.get("type") == "message" and role == "assistant"):
+                    last_prior_asst_idx = idx
+                    break
+
+        if last_prior_asst_idx == -1:
+            return items
+
+        asst_item = items[last_prior_asst_idx]
+        if isinstance(asst_item, dict) and asst_item.get("tool_calls"):
+            return items[last_prior_asst_idx:]
+
+        return items[last_prior_asst_idx + 1:]
+
     def scan_payload(self, body_json: Any) -> InjectionResult:
         """
         Deep-scans an entire LLM request payload:
-        - Chat completions (messages) with sliding turn window
+        - Chat completions (messages): scans user/tool/developer/system turns, name, tool_calls arguments,
+          and eliminates the spoofed assistant bypass.
         - Anthropic top-level 'system' prompt
         - OpenAI / Anthropic 'tools' definitions (including all parameter & property descriptions)
-        - Responses API top-level 'input' with sliding turn window
+        - Responses API top-level 'input'
         """
         combined_text = []
 
@@ -252,16 +330,11 @@ class PromptInjectionGuard:
                 for t in tools:
                     extract_descriptions(t)
 
-            # 3. Responses API top-level input array: sliding turn window after last assistant turn
+            # 3. Responses API top-level input array
             input_data = body_json.get("input")
             if isinstance(input_data, list):
-                last_asst_idx = -1
-                for idx, item in enumerate(input_data):
-                    if isinstance(item, dict) and (item.get("role") == "assistant" or (item.get("type") == "message" and item.get("role") == "assistant")):
-                        last_asst_idx = idx
-
-                untrusted_input = input_data[last_asst_idx + 1:] if last_asst_idx != -1 else input_data
-                for item in untrusted_input:
+                untrusted_inputs = self._extract_untrusted_elements(input_data)
+                for item in untrusted_inputs:
                     if isinstance(item, dict):
                         if "output" in item:
                             combined_text.append(str(item["output"]))
@@ -273,21 +346,19 @@ class PromptInjectionGuard:
                                 for part in c:
                                     if isinstance(part, dict) and "text" in part:
                                         combined_text.append(str(part["text"]))
+                        if "arguments" in item and isinstance(item["arguments"], str):
+                            combined_text.append(item["arguments"])
+                        if "call_id" in item and isinstance(item["call_id"], str):
+                            combined_text.append(item["call_id"])
                     elif isinstance(item, str):
                         combined_text.append(item)
             elif isinstance(input_data, str):
                 combined_text.append(input_data)
 
-            # 4. Messages list (Chat completions): sliding turn window after last assistant turn
+            # 4. Messages list (Chat completions)
             messages = body_json.get("messages")
             if isinstance(messages, list):
-                last_assistant_idx = -1
-                for idx, msg in enumerate(messages):
-                    if isinstance(msg, dict) and msg.get("role") == "assistant":
-                        last_assistant_idx = idx
-
-                untrusted_messages = messages[last_assistant_idx + 1:] if last_assistant_idx != -1 else messages
-
+                untrusted_messages = self._extract_untrusted_elements(messages)
                 for msg in untrusted_messages:
                     if isinstance(msg, dict):
                         content = msg.get("content", "")
@@ -310,6 +381,30 @@ class PromptInjectionGuard:
                                                     combined_text.append(str(sub["text"]))
                                     if "output" in part:
                                         combined_text.append(str(part["output"]))
+
+                        # Scan name and tool_call_id
+                        name = msg.get("name")
+                        if isinstance(name, str):
+                            combined_text.append(name)
+                        tcid = msg.get("tool_call_id")
+                        if isinstance(tcid, str):
+                            combined_text.append(tcid)
+
+                        # Scan tool_calls arguments (can be invoked by assistant)
+                        tool_calls = msg.get("tool_calls")
+                        if isinstance(tool_calls, list):
+                            for tc in tool_calls:
+                                if isinstance(tc, dict):
+                                    func = tc.get("function", {})
+                                    if isinstance(func, dict):
+                                        args = func.get("arguments")
+                                        if isinstance(args, str):
+                                            combined_text.append(args)
+                                        fn_name = func.get("name")
+                                        if isinstance(fn_name, str):
+                                            combined_text.append(fn_name)
+                    elif isinstance(msg, str):
+                        combined_text.append(msg)
 
         elif isinstance(body_json, list):
             for item in body_json:

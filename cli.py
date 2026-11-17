@@ -8,7 +8,7 @@ import getpass
 import subprocess
 import urllib.request
 import urllib.error
-from typing import Dict, Optional
+from typing import Dict, Any, Optional
 
 PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
@@ -16,9 +16,24 @@ TOKEN_FILE = os.path.join(PROXY_DIR, ".vault_token")
 PID_FILE = os.path.join(PROXY_DIR, "proxy.pid")
 LOG_FILE = os.path.join(PROXY_DIR, "proxy.log")
 SERVER_PY = os.path.join(PROXY_DIR, "server.py")
-PORT = 8765
-HOST = "127.0.0.1"
+
+
+def load_cli_config() -> Dict[str, Any]:
+    cfg = {"host": "127.0.0.1", "port": 8765, "secrets_file": "secrets.json"}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                cfg.update(json.load(f))
+        except Exception:
+            pass
+    return cfg
+
+
+cli_cfg = load_cli_config()
+HOST = str(cli_cfg.get("host", "127.0.0.1"))
+PORT = int(cli_cfg.get("port", 8765))
 BASE_URL = f"http://{HOST}:{PORT}"
+SECRETS_FILE = os.path.join(PROXY_DIR, str(cli_cfg.get("secrets_file", "secrets.json")))
 
 # ANSI Colors
 GREEN = "\033[92m"
@@ -252,8 +267,15 @@ def cmd_add(path_arg: str):
     env_list = config.setdefault("env_files", [])
     if abs_path not in env_list:
         env_list.append(abs_path)
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+        tmp_cfg = f"{CONFIG_FILE}.tmp_{os.getpid()}_{time.time_ns()}"
+        with open(tmp_cfg, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
+        if hasattr(os, "chmod") and sys.platform != "win32":
+            try:
+                os.chmod(tmp_cfg, 0o600)
+            except Exception:
+                pass
+        os.replace(tmp_cfg, CONFIG_FILE)
 
     if is_running():
         try:
@@ -311,7 +333,7 @@ def cmd_str(secret: str, label: Optional[str] = None):
         except Exception as e:
             print(f"{YELLOW}Warning: live update failed ({e}), saving to secrets.json...{RESET}")
 
-    secrets_path = os.path.join(PROXY_DIR, "secrets.json")
+    secrets_path = SECRETS_FILE
     stored = {}
     if os.path.exists(secrets_path):
         try:
@@ -335,13 +357,15 @@ def cmd_str(secret: str, label: Optional[str] = None):
 
     stored[new_ph] = secret
 
-    with open(secrets_path, "w", encoding="utf-8") as f:
+    tmp_sec = f"{secrets_path}.tmp_{os.getpid()}_{time.time_ns()}"
+    with open(tmp_sec, "w", encoding="utf-8") as f:
         json.dump(stored, f, indent=2, ensure_ascii=False)
     if hasattr(os, "chmod") and sys.platform != "win32":
         try:
-            os.chmod(secrets_path, 0o600)
+            os.chmod(tmp_sec, 0o600)
         except Exception:
             pass
+    os.replace(tmp_sec, secrets_path)
 
     print(f"{GREEN}{BOLD}✓ Saved to secrets.json{RESET} (will load on next start)")
     print(f"  Placeholder: {GREEN}{BOLD}{new_ph}{RESET}")

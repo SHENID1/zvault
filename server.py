@@ -45,6 +45,7 @@ DEFAULT_CONFIG_TOKEN_PREFIX = "zvault_sec_local_d98f"
 
 # Async lock for safe serialized file persistence
 file_write_lock = asyncio.Lock()
+MAX_BODY_SIZE = 20 * 1024 * 1024  # 20 MB max body size to protect against DoS
 
 config: Dict[str, Any] = {
     "host": "127.0.0.1",
@@ -255,16 +256,31 @@ def resolve_target_url(upstream_name_or_scheme: str, subpath: str) -> str:
 
 
 async def proxy_request_handler(target_url: str, request: Request) -> Response:
+    # Strip URL fragment if present
+    target_url = target_url.split("#")[0]
+    safe_target_url = target_url.split("?")[0]
     parsed = urlparse(target_url)
     target_host = parsed.netloc
 
     if not check_domain_allowed(target_url):
-        log_warn(f"Target URL '{target_url}' is NOT in allowed_hosts list! Request blocked for security.")
+        log_warn(f"Target URL '{safe_target_url}' is NOT in allowed_hosts list! Request blocked for security.")
         raise HTTPException(status_code=403, detail="Target host not in allowed_hosts or invalid")
 
-    log_shield(f"{request.method} -> {target_url}")
+    log_shield(f"{request.method} -> {safe_target_url}")
+
+    # Enforce request body size limit to protect from DoS / memory exhaustion
+    cl_header = request.headers.get("content-length")
+    if cl_header:
+        try:
+            if int(cl_header) > MAX_BODY_SIZE:
+                raise HTTPException(status_code=413, detail="Payload Too Large: request body exceeds 20MB limit")
+        except ValueError:
+            pass
 
     raw_body = await request.body()
+    if len(raw_body) > MAX_BODY_SIZE:
+        raise HTTPException(status_code=413, detail="Payload Too Large: request body exceeds 20MB limit")
+
     masked_body = raw_body
 
     req_ct = request.headers.get("content-type", "").lower()
@@ -274,9 +290,9 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
         try:
             body_json = json.loads(raw_body.decode("utf-8"))
 
-            # Deep-scan entire payload for prompt injections & jailbreaks
+            # Deep-scan entire payload for prompt injections & jailbreaks in background worker thread
             if injection_cfg.get("enabled", True):
-                inj_res = injection_guard.scan_payload(body_json)
+                inj_res = await asyncio.to_thread(injection_guard.scan_payload, body_json)
                 if inj_res.is_malicious:
                     action = injection_cfg.get("action", "block").lower()
                     if action == "block":
@@ -285,7 +301,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                     else:
                         log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
 
-            masked_json, count = vault.mask_payload(body_json)
+            masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
             if count > 0:
                 log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
             masked_body = json.dumps(masked_json, ensure_ascii=False).encode("utf-8")
@@ -294,7 +310,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
         except Exception:
             try:
                 body_str = raw_body.decode("utf-8")
-                masked_str, count = vault.mask_text(body_str)
+                masked_str, count = await asyncio.to_thread(vault.mask_text, body_str)
                 if count > 0:
                     log_mask(f"Replaced {count} secret(s) in raw text before sending to {target_host}")
                 masked_body = masked_str.encode("utf-8")
@@ -404,7 +420,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             )
 
         resp_text = resp_bytes.decode("utf-8", errors="replace")
-        demasked_text, demask_count = vault.demask_json_str(resp_text)
+        demasked_text, demask_count = await asyncio.to_thread(vault.demask_json_str, resp_text)
         if demask_count > 0:
             log_demask(f"Restored {demask_count} secret placeholder(s) in response body!")
 
@@ -420,7 +436,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
     except Exception as e:
         if own_client:
             await client.aclose()
-        log_warn(f"Proxy error forwarding to {target_url}: {e}")
+        log_warn(f"Proxy error forwarding to {safe_target_url}: {e}")
         raise HTTPException(status_code=502, detail=f"Proxy error: {str(e)}")
 
 
@@ -530,10 +546,10 @@ async def test_echo(request: Request):
     raw_body = await request.body()
     try:
         body_json = json.loads(raw_body.decode("utf-8"))
-        inj_res = injection_guard.scan_payload(body_json)
+        inj_res = await asyncio.to_thread(injection_guard.scan_payload, body_json)
 
-        masked_json, mask_count = vault.mask_payload(body_json)
-        _, demask_count = vault.demask_payload(masked_json)
+        masked_json, mask_count = await asyncio.to_thread(vault.mask_payload, body_json)
+        _, demask_count = await asyncio.to_thread(vault.demask_payload, masked_json)
 
         return {
             "status": "success",
