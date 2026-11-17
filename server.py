@@ -120,7 +120,7 @@ env_files = config.get("env_files", [".env"])
 vault = SecretVault(secrets_path, env_files=env_files, state_file=state_file_path)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
-injection_cfg = config.get("injection_guard", {"enabled": True, "action": "warn", "sensitivity": 0.65})
+injection_cfg = config.get("injection_guard", {"enabled": True, "action": "block", "sensitivity": 0.65})
 injection_guard = PromptInjectionGuard(sensitivity=float(injection_cfg.get("sensitivity", 0.65)))
 
 
@@ -148,10 +148,15 @@ def log_warn(msg: str):
 
 
 @app.middleware("http")
-async def dns_rebinding_protection(request: Request, call_next):
-    host_header = request.headers.get("host", "")
-    req_host = host_header.split(":")[0].strip().lower()
-    configured_host = str(config.get("host", "127.0.0.1")).lower()
+async def security_middleware(request: Request, call_next):
+    # 1. Host header & DNS rebinding protection (supports IPv6 brackets e.g. [::1]:8765)
+    host_header = request.headers.get("host", "").strip()
+    if host_header.startswith("["):
+        req_host = host_header.split("]")[0].strip("[").lower()
+    else:
+        req_host = host_header.split(":")[0].strip().lower()
+
+    configured_host = str(config.get("host", "127.0.0.1")).lower().strip("[]")
     allowed_server_hosts = {"127.0.0.1", "localhost", "::1", configured_host}
 
     if req_host not in allowed_server_hosts:
@@ -159,6 +164,19 @@ async def dns_rebinding_protection(request: Request, call_next):
             content="Forbidden: Invalid Host header (DNS rebinding protection)",
             status_code=403
         )
+
+    # 2. CSRF & Cross-Origin browser protection (Sec-Fetch-Site and Origin header checks)
+    sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+    if sec_fetch_site == "cross-site":
+        return Response(content="Forbidden: Cross-site request rejected", status_code=403)
+
+    origin = request.headers.get("origin")
+    if origin:
+        parsed_origin = urlparse(origin)
+        orig_host = (parsed_origin.hostname or "").lower().strip("[]")
+        if orig_host not in allowed_server_hosts:
+            return Response(content="Forbidden: Cross-origin request blocked", status_code=403)
+
     return await call_next(request)
 
 
@@ -173,7 +191,15 @@ def verify_vault_token(request: Request):
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
 
-    if not token or not hmac.compare_digest(token, CURRENT_VAULT_TOKEN):
+    if not token:
+        raise HTTPException(status_code=401, detail="Unauthorized: valid X-Vault-Token required")
+
+    try:
+        is_valid = hmac.compare_digest(token.encode("utf-8"), CURRENT_VAULT_TOKEN.encode("utf-8"))
+    except Exception:
+        is_valid = False
+
+    if not is_valid:
         raise HTTPException(status_code=401, detail="Unauthorized: valid X-Vault-Token required")
 
 
@@ -241,7 +267,10 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
     raw_body = await request.body()
     masked_body = raw_body
 
-    if raw_body:
+    req_ct = request.headers.get("content-type", "").lower()
+    is_multipart = req_ct.startswith("multipart/")
+
+    if raw_body and not is_multipart:
         try:
             body_json = json.loads(raw_body.decode("utf-8"))
 
@@ -249,7 +278,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             if injection_cfg.get("enabled", True):
                 inj_res = injection_guard.scan_payload(body_json)
                 if inj_res.is_malicious:
-                    action = injection_cfg.get("action", "warn").lower()
+                    action = injection_cfg.get("action", "block").lower()
                     if action == "block":
                         log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
                         raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
@@ -276,10 +305,14 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                     detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
                 )
 
-    # 2. Prepare headers
+    # 2. Prepare headers (strip internal and hop-by-hop headers)
     forward_headers = {}
+    strip_hdrs = {
+        "host", "content-length", "connection", "accept-encoding",
+        "x-vault-token", "te", "upgrade", "keep-alive", "proxy-authenticate", "proxy-authorization"
+    }
     for k, v in request.headers.items():
-        if k.lower() not in ("host", "content-length", "connection", "accept-encoding"):
+        if k.lower() not in strip_hdrs:
             forward_headers[k] = v
 
     forward_headers["Host"] = parsed.hostname or target_host
@@ -344,7 +377,7 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                 media_type="text/event-stream"
             )
 
-        # 5. Handle Non-Streaming Responses (Normal JSON / Text)
+        # 5. Handle Non-Streaming Responses (Normal JSON / Text vs Binary Images/Audio/Files)
         try:
             resp_bytes = await upstream_resp.aread()
         finally:
@@ -352,15 +385,28 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
             if own_client:
                 await client.aclose()
 
-        resp_text = resp_bytes.decode("utf-8", errors="replace")
-        demasked_text, demask_count = vault.demask_json_str(resp_text)
-        if demask_count > 0:
-            log_demask(f"Restored {demask_count} secret placeholder(s) in response body!")
-
         resp_headers = {
             k: v for k, v in upstream_resp.headers.items()
             if k.lower() not in ("content-length", "content-encoding", "transfer-encoding")
         }
+
+        # Check if content type is textual or JSON
+        resp_ct = (upstream_resp.headers.get("content-type") or "").lower()
+        is_textual = any(t in resp_ct for t in ("application/json", "text/", "application/x-ndjson", "application/xml", "application/javascript"))
+
+        if not is_textual:
+            # Pass raw binary content (images, audio, downloads) untouched
+            return Response(
+                content=resp_bytes,
+                status_code=upstream_resp.status_code,
+                headers=resp_headers,
+                media_type=upstream_resp.headers.get("content-type")
+            )
+
+        resp_text = resp_bytes.decode("utf-8", errors="replace")
+        demasked_text, demask_count = vault.demask_json_str(resp_text)
+        if demask_count > 0:
+            log_demask(f"Restored {demask_count} secret placeholder(s) in response body!")
 
         return Response(
             content=demasked_text.encode("utf-8"),
@@ -418,15 +464,16 @@ async def add_secret_endpoint(request: Request):
             if os.path.exists(secrets_path):
                 with open(secrets_path, "r", encoding="utf-8") as f:
                     stored = json.load(f)
-            stored_key = label if (label and not label.startswith("__")) else placeholder
-            stored[stored_key] = secret
-            with open(secrets_path, "w", encoding="utf-8") as f:
+            stored[placeholder] = secret
+            tmp_sec = f"{secrets_path}.tmp_{os.getpid()}"
+            with open(tmp_sec, "w", encoding="utf-8") as f:
                 json.dump(stored, f, indent=2, ensure_ascii=False)
             if hasattr(os, "chmod") and sys.platform != "win32":
                 try:
-                    os.chmod(secrets_path, 0o600)
+                    os.chmod(tmp_sec, 0o600)
                 except Exception:
                     pass
+            os.replace(tmp_sec, secrets_path)
         except Exception as e:
             log_warn(f"Failed to persist secret to secrets.json: {e}")
 
@@ -456,8 +503,15 @@ async def add_env_endpoint(request: Request):
         if path not in env_list:
             env_list.append(path)
             try:
-                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                tmp_cfg = f"{CONFIG_FILE}.tmp_{os.getpid()}"
+                with open(tmp_cfg, "w", encoding="utf-8") as f:
                     json.dump(config, f, indent=2, ensure_ascii=False)
+                if hasattr(os, "chmod") and sys.platform != "win32":
+                    try:
+                        os.chmod(tmp_cfg, 0o600)
+                    except Exception:
+                        pass
+                os.replace(tmp_cfg, CONFIG_FILE)
             except Exception as e:
                 log_warn(f"Failed to update config.json: {e}")
 
@@ -499,13 +553,13 @@ async def test_echo(request: Request):
         return {"error": str(e)}
 
 
-@app.api_route("/proxy/{scheme}/{subpath:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+@app.api_route("/proxy/{scheme}/{subpath:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def universal_proxy(scheme: str, subpath: str, request: Request):
     target_url = resolve_target_url(scheme, subpath)
     return await proxy_request_handler(target_url, request)
 
 
-@app.api_route("/{upstream_name}/{subpath:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
+@app.api_route("/{upstream_name}/{subpath:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def named_upstream_proxy(upstream_name: str, subpath: str, request: Request):
     if upstream_name in config.get("upstreams", {}):
         target_url = resolve_target_url(upstream_name, subpath)

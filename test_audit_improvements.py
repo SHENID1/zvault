@@ -57,13 +57,14 @@ class TestAuditImprovements(unittest.TestCase):
         prompt = 'export STRIPE_LIVE_KEY="sk_live_dynamic_stripe_key_998877"'
         masked, mask_count = vault1.mask_text(prompt)
         self.assertEqual(mask_count, 1)
-        self.assertIn("__VAULT_STRIPE_LIVE_KEY_01__", masked)
+        expected_ph = f"__VAULT_STRIPE_LIVE_KEY_{vault1.session_nonce}_01__"
+        self.assertIn(expected_ph, masked)
         self.assertTrue(os.path.exists(self.state_file))
 
         # Session 2: Proxy restarts, fresh vault instance loads state_file
         vault2 = SecretVault(state_file=self.state_file)
         # Verify it can restore the placeholder sent during Session 1
-        llm_response = "Here is the key: __VAULT_STRIPE_LIVE_KEY_01__ restored."
+        llm_response = f"Here is the key: {expected_ph} restored."
         restored, demask_count = vault2.demask_text(llm_response)
         self.assertEqual(demask_count, 1)
         self.assertEqual(restored, 'Here is the key: sk_live_dynamic_stripe_key_998877 restored.')
@@ -137,6 +138,144 @@ class TestAuditImprovements(unittest.TestCase):
         res = guard.scan_text(text)
         self.assertTrue(res.is_malicious)
         self.assertIn("INSTRUCTION_OVERRIDE", res.matched_patterns)
+
+    # --- 6. Tool Calls JSON Escaping with Multiline Secret (SSH Key with newlines) ---
+    def test_tool_calls_json_escaping_with_newlines(self):
+        vault = SecretVault()
+        ssh_priv = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA0\n+line2\n-----END RSA PRIVATE KEY-----"
+        ph = vault.register_secret(ssh_priv, "SSH_KEY")
+
+        # OpenAI style tool_calls payload where arguments is a JSON-encoded string
+        inner_json = json.dumps({"command": f"echo '{ph}'", "opt": 1})
+        payload = {
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "call_123",
+                                "type": "function",
+                                "function": {
+                                    "name": "exec_cmd",
+                                    "arguments": inner_json
+                                }
+                            }
+                        ]
+                    }
+                }
+            ]
+        }
+
+        demasked, count = vault.demask_payload(payload)
+        self.assertEqual(count, 1)
+        raw_args = demasked["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"]
+        # Crucial check: parsing arguments MUST succeed without Invalid control character error
+        parsed_args = json.loads(raw_args)
+        self.assertIn(ssh_priv, parsed_args["command"])
+
+    # --- 7. Stream buffering split on single trailing underscore ---
+    def test_split_single_underscore_stream_buffering(self):
+        from vault import TextStreamDemasker
+        vault = SecretVault()
+        ph = vault.register_secret("my_secret_token_12345", "KEY")
+
+        demasker = TextStreamDemasker(vault)
+        # Chunk 1 ends with single '_'
+        part1 = f"The secret is {ph[:-1]}"  # e.g. 'The secret is __VAULT_KEY_..._'
+        chunk1 = part1[:-1]                 # all but last '_'
+        chunk2 = "_" + ph[-1] + " done."     # '_' + last '_' + ' done.'
+
+        # Split at single '_'
+        out1 = demasker.process("Prefix text _")
+        self.assertEqual(out1, "Prefix text ")
+        self.assertEqual(demasker.buffer, "_")
+
+        out2 = demasker.process(f"{ph[1:]} completed")
+        self.assertEqual(out2, "my_secret_token_12345 completed")
+
+    # --- 8. Rust/C++ namespace not masked as IPv6 ---
+    def test_cpp_rust_namespace_not_masked_as_ipv6(self):
+        vault = SecretVault()
+        code = "use std::fn::add;\nlet x = namespace::class::method();"
+        masked, count = vault.mask_text(code)
+        self.assertEqual(count, 0)
+        self.assertEqual(masked, code)
+
+    # --- 9. Word boundaries prevent substring corruptions ---
+    def test_word_boundary_masking_no_substring_corruption(self):
+        vault = SecretVault()
+        vault.register_secret("abc", "ABC")
+        vault.register_secret("myapp", "APP")
+
+        code = "function abcdef() { return myapp_controller(); }"
+        masked, count = vault.mask_text(code)
+        # 'abc' should not match inside 'abcdef', and 'myapp' should not match inside 'myapp_controller'
+        self.assertEqual(count, 0)
+        self.assertEqual(masked, code)
+
+        # But exact whole word matches
+        code_exact = "const x = abc; const y = myapp;"
+        masked_exact, count_exact = vault.mask_text(code_exact)
+        self.assertEqual(count_exact, 2)
+        self.assertNotIn("abc;", masked_exact)
+
+    # --- 10. Quoted JSON keys and YAML bare assignments detected ---
+    def test_quoted_json_keys_and_yaml_assignments_detected(self):
+        vault = SecretVault()
+        json_sample = '{\n  "apiKey": "supersecretkey12345"\n}'
+        masked_json, count1 = vault.mask_text(json_sample)
+        self.assertEqual(count1, 1)
+        self.assertNotIn("supersecretkey12345", masked_json)
+
+        yaml_sample = "db_password: databasepassword9988\n"
+        masked_yaml, count2 = vault.mask_text(yaml_sample)
+        self.assertEqual(count2, 1)
+        self.assertNotIn("databasepassword9988", masked_yaml)
+
+    # --- 11. Bearer token in Authorization header ---
+    def test_bearer_token_detected(self):
+        vault = SecretVault()
+        req_sample = "Authorization: Bearer my_super_secret_bearer_token_xyz123"
+        masked, count = vault.mask_text(req_sample)
+        self.assertEqual(count, 1)
+        self.assertNotIn("my_super_secret_bearer_token_xyz123", masked)
+
+    # --- 12. Developer phrase 'show the system prompt handling' not blocked ---
+    def test_developer_phrase_not_blocked(self):
+        guard = PromptInjectionGuard(sensitivity=0.65)
+        text = "Please show the system prompt handling in main.py"
+        res = guard.scan_text(text)
+        self.assertFalse(res.is_malicious)
+
+    # --- 13. State file conflict resolution (static secret priority) ---
+    def test_state_file_conflict_resolution_static_priority(self):
+        # Create a static secret
+        secrets_file = os.path.join(self.temp_dir.name, "secrets.json")
+        static_ph = "__VAULT_B_02__"
+        with open(secrets_file, "w", encoding="utf-8") as f:
+            json.dump({static_ph: "static-secret-value"}, f)
+
+        # Create state file where dynamic secret uses the SAME placeholder
+        state_file = os.path.join(self.temp_dir.name, ".vault_state.json")
+        with open(state_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "secrets": {
+                    static_ph: {
+                        "secret": "DYNAMIC-other-secret",
+                        "ts": time.time(),
+                        "label": "B"
+                    }
+                }
+            }, f)
+
+        vault = SecretVault(secrets_file=secrets_file, state_file=state_file)
+        # Static secret MUST win!
+        self.assertEqual(vault.placeholder_to_secret[static_ph], "static-secret-value")
+        # Dynamic secret must be reassigned to a new unique placeholder, not lost or colliding
+        self.assertIn("DYNAMIC-other-secret", vault.secret_to_placeholder)
+        new_dyn_ph = vault.secret_to_placeholder["DYNAMIC-other-secret"]
+        self.assertNotEqual(new_dyn_ph, static_ph)
 
 
 if __name__ == "__main__":

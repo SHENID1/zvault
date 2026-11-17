@@ -67,7 +67,8 @@ class PromptInjectionGuard:
 
         # 4. System prompt & secret exfiltration leaks (EN & RU)
         self.prompt_leak_patterns = [
-            (r"(?i)\b(?:repeat|reveal|print|output|display|show|dump)\b[\s\S]{0,40}\b(?:your\s+)?(?:initial|original|core|hidden|system)?\s*(?:system\s+)?(?:prompt|instructions?|directives?)\b", "PROMPT_LEAK"),
+            (r"(?i)\b(?:repeat|reveal|print|output|display|dump)\b[\s\S]{0,35}\b(?:your|all|hidden)\b[\s\S]{0,25}\b(?:(?:initial|system|original|core)\s+)*(?:prompt|instructions?)\b", "PROMPT_LEAK"),
+            (r"(?i)\bshow\s+(?:me\s+)?(?:your|all|the\s+entire|hidden)\s+(?:(?:initial|system|original|core)\s+)*(?:prompt|instructions?)\b", "PROMPT_LEAK"),
             (r"(?i)\bwhat\s+(?:are|were)\s+your\s+(?:original|initial|system)\s+(?:instructions?|prompts?)\b", "PROMPT_LEAK"),
             (r"(?i)\boutput\s+everything\s+starting\s+with\s+[\"']?(?:you\s+are|<\|im_start\|>)\b", "PROMPT_LEAK"),
             (r"(?i)\b(?:выведи|покажи|распечатай|повтори)\s+(?:свой\s+)?(?:системный\s+промпт|исходные\s+инструкции|инструкции\s+выше)\b", "PROMPT_LEAK_RU"),
@@ -234,7 +235,7 @@ class PromptInjectionGuard:
                     if isinstance(item, dict) and "text" in item:
                         combined_text.append(str(item["text"]))
 
-            # 2. Top-level tools definitions: recursively scan ALL descriptions (including parameters / properties)
+            # 2. Tool definitions: scan parameter and property descriptions for tool poisoning attacks
             tools = body_json.get("tools")
             if isinstance(tools, list):
                 def extract_descriptions(obj: Any):
