@@ -12,6 +12,7 @@ from typing import Dict, Optional
 
 PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
+TOKEN_FILE = os.path.join(PROXY_DIR, ".vault_token")
 PID_FILE = os.path.join(PROXY_DIR, "proxy.pid")
 LOG_FILE = os.path.join(PROXY_DIR, "proxy.log")
 SERVER_PY = os.path.join(PROXY_DIR, "server.py")
@@ -29,17 +30,31 @@ RESET = "\033[0m"
 
 
 def get_auth_headers() -> Dict[str, str]:
-    """Retrieves CLI headers including authentication token from config.json."""
+    """Retrieves CLI headers including authentication token from .vault_token or config.json."""
     headers = {"User-Agent": "ZVault-CLI"}
-    if os.path.exists(CONFIG_FILE):
+    token = None
+
+    # Check .vault_token first
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                t = f.read().strip()
+                if t:
+                    token = t
+        except Exception:
+            pass
+
+    # Check config.json if not found
+    if not token and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
                 token = cfg.get("vault_token")
-                if token:
-                    headers["X-Vault-Token"] = token
         except Exception:
             pass
+
+    if token:
+        headers["X-Vault-Token"] = token
     return headers
 
 
@@ -152,7 +167,7 @@ def cmd_stop():
         except Exception:
             pass
 
-    # If PID file was stale or missing, find process listening strictly on :PORT
+    # If PID file was stale or missing, find process listening strictly on :PORT (listening sockets only!)
     if not stopped or is_running():
         try:
             if sys.platform == "win32":
@@ -165,7 +180,8 @@ def cmd_stop():
                         subprocess.run(["taskkill", "/F", "/PID", port_pid], capture_output=True)
                         stopped = True
             else:
-                lsof = subprocess.run(["lsof", "-t", f"-i:{PORT}"], capture_output=True, text=True)
+                # -sTCP:LISTEN strictly matches listening server processes, not client sockets (e.g. IDE)
+                lsof = subprocess.run(["lsof", "-t", "-sTCP:LISTEN", f"-i:{PORT}"], capture_output=True, text=True)
                 for p in lsof.stdout.strip().splitlines():
                     if p:
                         os.kill(int(p), signal.SIGKILL)
@@ -173,7 +189,6 @@ def cmd_stop():
         except Exception:
             pass
 
-    # Wait for port to be released
     for _ in range(12):
         if not is_running():
             break
@@ -229,7 +244,6 @@ def cmd_add(path_arg: str):
         print(f"{RED}Error:{RESET} File not found: {abs_path}")
         return
 
-    # 1. Update config.json
     config = {}
     if os.path.exists(CONFIG_FILE):
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
@@ -241,7 +255,6 @@ def cmd_add(path_arg: str):
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2, ensure_ascii=False)
 
-    # 2. If running, notify server dynamically with auth headers
     if is_running():
         try:
             headers = get_auth_headers()
@@ -274,7 +287,6 @@ def cmd_str(secret: str, label: Optional[str] = None):
         print(f"{RED}Error:{RESET} Secret string cannot be empty.")
         return
 
-    # If server is running, use live authenticated API
     if is_running():
         try:
             headers = get_auth_headers()
@@ -299,7 +311,6 @@ def cmd_str(secret: str, label: Optional[str] = None):
         except Exception as e:
             print(f"{YELLOW}Warning: live update failed ({e}), saving to secrets.json...{RESET}")
 
-    # Fallback / offline mode: save to secrets.json
     secrets_path = os.path.join(PROXY_DIR, "secrets.json")
     stored = {}
     if os.path.exists(secrets_path):
@@ -309,13 +320,11 @@ def cmd_str(secret: str, label: Optional[str] = None):
         except Exception:
             stored = {}
 
-    # Check for exact duplicate secret
     for ph, sec in stored.items():
         if sec == secret:
             print(f"{YELLOW}Secret already registered!{RESET} Reusing placeholder: {GREEN}{BOLD}{ph}{RESET}")
             return
 
-    # Generate unique placeholder avoiding collisions even after deletions
     clean_label = (label or "STR").upper()
     next_idx = 1
     while True:
@@ -328,6 +337,11 @@ def cmd_str(secret: str, label: Optional[str] = None):
 
     with open(secrets_path, "w", encoding="utf-8") as f:
         json.dump(stored, f, indent=2, ensure_ascii=False)
+    if hasattr(os, "chmod") and sys.platform != "win32":
+        try:
+            os.chmod(secrets_path, 0o600)
+        except Exception:
+            pass
 
     print(f"{GREEN}{BOLD}✓ Saved to secrets.json{RESET} (will load on next start)")
     print(f"  Placeholder: {GREEN}{BOLD}{new_ph}{RESET}")
@@ -388,7 +402,6 @@ def main():
         cmd_add(args[1])
     elif command in ("str", "secret"):
         if len(args) < 2:
-            # Secure interactive input to avoid leaking secret in shell history / process table
             try:
                 secret_val = getpass.getpass("Enter secret string (input hidden): ").strip()
             except Exception:

@@ -34,7 +34,7 @@ class InjectionResult:
 
 
 class PromptInjectionGuard:
-    def __init__(self, sensitivity: float = 0.6):
+    def __init__(self, sensitivity: float = 0.65):
         self.sensitivity = sensitivity
 
         # 1. Direct instruction overrides & memory wipes (English)
@@ -47,7 +47,7 @@ class PromptInjectionGuard:
         # 2. Instruction overrides & memory wipes (Russian)
         self.override_patterns_ru = [
             (r"(?i)\b(?:игнорируй|забудь|отмени|пропусти|сбрось)\b[\s\S]{0,40}\b(?:все|предыдущие|прошлые|системные|исходные|начальные)\b[\s\S]{0,40}\b(?:инструкции|правила|указания|директивы|промпты|ограничения)\b", "INSTRUCTION_OVERRIDE_RU"),
-            (r"(?i)\b(?:забудь|игнорируй)\s+вс[её]\s+(?:выше|до\s+этого|сказанное|ранее)\b", "INSTRUCTION_OVERRIDE_RU"),
+            (r"(?i)\b(?:забудь|игнорируй)\s+вс[её](?:,\s*что)?\s+(?:было\s+)?(?:выше|до\s+этого|сказанное|ранее)\b", "INSTRUCTION_OVERRIDE_RU"),
             (r"(?i)\b(?:новые|обновленн(?:ые|ая))\s+(?:системн(?:ые|ая)\s+)?инструкци(?:и|я)\s*:\s*(?:отныне|ты\s+должен|всегда|делай\s+вс[её])\b", "INSTRUCTION_OVERRIDE_RU"),
         ]
 
@@ -76,12 +76,15 @@ class PromptInjectionGuard:
             (r"(?i)\[\s*ASSISTANT\s*\]\s*:\s*I\s+will\s+now\s+follow", "ROLE_SPOOFING"),
         ]
 
-        # 6. Remote payload execution & destructive shell payloads
-        # Notice: no trailing \b after / to correctly catch "rm -rf /"
+        # 6. Destructive commands (strictly root filesystem / drive formatting, NOT normal build cleanup)
         self.destructive_shell_patterns = [
-            (r"(?i)\b(?:invoke-webrequest|iwr|curl|wget)\b[\s\S]{0,60}\|\s*(?:iex|sh|bash)\b", "MALICIOUS_DOWNLOAD_EXEC"),
+            (r"(?i)(?:\brm\s+-(?:r[fF]|f[rR]|r|f)\s+(?:\/(?:\*|\s|$|\;|\&))|rmdir\s+\/s\s+\/q\s+[c-zC-Z]:\\|format\s+[c-zC-Z]:)", "DESTRUCTIVE_COMMAND"),
             (r"(?i)\bpowershell(?:\.exe)?\s+-[eE]nc(?:odedcommand)?\b", "ENCODED_POWERSHELL"),
-            (r"(?i)(?:\brm\s+-(?:r[fF]|f[rR]|r|f)\s+(?:\/(?:[*\s;]|$)|~|\.\.)|rmdir\s+\/s\s+\/q\s+[c-zC-Z]:\\|format\s+[c-zC-Z]:)", "DESTRUCTIVE_COMMAND"),
+        ]
+
+        # 7. Download & exec patterns (weight 0.55 so documentation examples in README don't trigger alone)
+        self.download_exec_patterns = [
+            (r"(?i)\b(?:invoke-webrequest|iwr|curl|wget)\b[\s\S]{0,60}\|\s*(?:iex|sh|bash)\b", "MALICIOUS_DOWNLOAD_EXEC"),
         ]
 
     def normalize(self, text: str) -> Tuple[str, str, bool]:
@@ -96,7 +99,6 @@ class PromptInjectionGuard:
         return normalized, latin_normalized, has_invisible
 
     def scan_base64_payloads(self, text: str) -> List[Tuple[str, str]]:
-        """Finds base64 encoded strings and checks if decoded content contains overrides."""
         findings = []
         b64_candidates = re.findall(r"(?:^|\s|[\"'])((?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)(?:$|\s|[\"'])", text)
 
@@ -136,7 +138,7 @@ class PromptInjectionGuard:
                 matched.append(tag)
                 highest_category = tag
 
-        # 2. Scan text against pattern groups
+        # 2. Scan text against pattern groups with balanced weights
         pattern_groups = [
             (self.destructive_shell_patterns, 0.85),
             (self.override_patterns, 0.75),
@@ -148,7 +150,6 @@ class PromptInjectionGuard:
 
         for patterns, weight in pattern_groups:
             for pattern, label in patterns:
-                # Test against raw, normalized, and homoglyph-resolved versions
                 if (re.search(pattern, text) or
                     re.search(pattern, normalized_text) or
                     re.search(pattern, latin_text)):
@@ -156,6 +157,18 @@ class PromptInjectionGuard:
                     base_score = max(base_score, weight)
                     if not highest_category:
                         highest_category = label
+
+        # Download & execute: distinguish direct execution vs markdown code block / documentation example
+        for pattern, label in self.download_exec_patterns:
+            if (re.search(pattern, text) or
+                re.search(pattern, normalized_text) or
+                re.search(pattern, latin_text)):
+                matched.append(label)
+                is_doc_example = bool(re.search(r"```|(?:install|setup|usage|readme|example|docker|guide)[\s\S]{0,40}(?:curl|wget)", text, re.IGNORECASE))
+                weight = 0.50 if is_doc_example else 0.70
+                base_score = max(base_score, weight)
+                if not highest_category:
+                    highest_category = label
 
         # Additional risk if multiple patterns match
         if len(matched) > 1:
@@ -172,54 +185,102 @@ class PromptInjectionGuard:
             details=f"Risk: {round(base_score, 2)}, Category: {highest_category}, Matches: {', '.join(set(matched))}" if is_malicious else "Safe"
         )
 
-    def scan_messages(self, messages: Any) -> InjectionResult:
+    def scan_payload(self, body_json: Any) -> InjectionResult:
         """
-        Scans ONLY newly arrived untrusted content:
-        - Latest user messages and tool results (after the last assistant response)
-        - Prevents rescan loops from bricking conversations after a single trigger
-        - Deep-scans tool_result, function_call_output, etc.
+        Deep-scans an entire LLM request payload:
+        - Chat completions (messages)
+        - Anthropic top-level 'system' prompt
+        - OpenAI / Anthropic 'tools' definitions
+        - Responses API top-level 'input' and 'function_call_output'
         """
         combined_text = []
 
-        if isinstance(messages, list):
-            # Find index of last assistant turn
-            last_assistant_idx = -1
-            for idx, msg in enumerate(messages):
-                if isinstance(msg, dict) and msg.get("role") == "assistant":
-                    last_assistant_idx = idx
+        if isinstance(body_json, dict):
+            # 1. Top-level system prompt (Anthropic)
+            sys_prompt = body_json.get("system")
+            if isinstance(sys_prompt, str):
+                combined_text.append(sys_prompt)
+            elif isinstance(sys_prompt, list):
+                for item in sys_prompt:
+                    if isinstance(item, dict) and "text" in item:
+                        combined_text.append(str(item["text"]))
 
-            # Only scan messages appearing after the last assistant response
-            # (or all messages if no assistant response has occurred yet)
-            untrusted_messages = messages[last_assistant_idx + 1:] if last_assistant_idx != -1 else messages
+            # 2. Top-level tools definitions
+            tools = body_json.get("tools")
+            if isinstance(tools, list):
+                for t in tools:
+                    if isinstance(t, dict):
+                        func = t.get("function", t)
+                        if "description" in func:
+                            combined_text.append(str(func["description"]))
 
-            for msg in untrusted_messages:
-                if isinstance(msg, dict):
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        combined_text.append(content)
-                    elif isinstance(content, list):
-                        for part in content:
-                            if isinstance(part, str):
-                                combined_text.append(part)
-                            elif isinstance(part, dict):
-                                # Text blocks
-                                if "text" in part:
-                                    combined_text.append(str(part["text"]))
-                                # Anthropic tool_result content
-                                if part.get("type") == "tool_result":
-                                    tr_content = part.get("content", "")
-                                    if isinstance(tr_content, str):
-                                        combined_text.append(tr_content)
-                                    elif isinstance(tr_content, list):
-                                        for sub in tr_content:
-                                            if isinstance(sub, dict) and "text" in sub:
-                                                combined_text.append(str(sub["text"]))
-                                # Function call output in Responses API
-                                if "output" in part:
-                                    combined_text.append(str(part["output"]))
+            # 3. Responses API top-level input array (containing function_call_output)
+            input_data = body_json.get("input")
+            if isinstance(input_data, list):
+                for item in input_data:
+                    if isinstance(item, dict):
+                        # function_call_output items
+                        if "output" in item:
+                            combined_text.append(str(item["output"]))
+                        if "content" in item:
+                            c = item["content"]
+                            if isinstance(c, str):
+                                combined_text.append(c)
+                            elif isinstance(c, list):
+                                for part in c:
+                                    if isinstance(part, dict) and "text" in part:
+                                        combined_text.append(str(part["text"]))
+                    elif isinstance(item, str):
+                        combined_text.append(item)
+            elif isinstance(input_data, str):
+                combined_text.append(input_data)
 
-        elif isinstance(messages, str):
-            combined_text.append(messages)
+            # 4. Messages list (Chat completions)
+            messages = body_json.get("messages")
+            if isinstance(messages, list):
+                last_assistant_idx = -1
+                for idx, msg in enumerate(messages):
+                    if isinstance(msg, dict) and msg.get("role") == "assistant":
+                        last_assistant_idx = idx
+
+                untrusted_messages = messages[last_assistant_idx + 1:] if last_assistant_idx != -1 else messages
+
+                for msg in untrusted_messages:
+                    if isinstance(msg, dict):
+                        content = msg.get("content", "")
+                        if isinstance(content, str):
+                            combined_text.append(content)
+                        elif isinstance(content, list):
+                            for part in content:
+                                if isinstance(part, str):
+                                    combined_text.append(part)
+                                elif isinstance(part, dict):
+                                    if "text" in part:
+                                        combined_text.append(str(part["text"]))
+                                    if part.get("type") == "tool_result":
+                                        tr_content = part.get("content", "")
+                                        if isinstance(tr_content, str):
+                                            combined_text.append(tr_content)
+                                        elif isinstance(tr_content, list):
+                                            for sub in tr_content:
+                                                if isinstance(sub, dict) and "text" in sub:
+                                                    combined_text.append(str(sub["text"]))
+                                    if "output" in part:
+                                        combined_text.append(str(part["output"]))
+
+        elif isinstance(body_json, list):
+            for item in body_json:
+                res = self.scan_payload(item)
+                if res.is_malicious:
+                    return res
+        elif isinstance(body_json, str):
+            combined_text.append(body_json)
 
         full_content = "\n".join(combined_text)
         return self.scan_text(full_content)
+
+    def scan_messages(self, messages: Any) -> InjectionResult:
+        """Backward-compatible wrapper for scan_payload."""
+        if isinstance(messages, dict):
+            return self.scan_payload(messages)
+        return self.scan_payload({"messages": messages})

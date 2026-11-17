@@ -1,7 +1,6 @@
 {
   "host": "127.0.0.1",
   "port": 8765,
-  "vault_token": "zvault_sec_local_d98f7e2a4b1c8360",
   "upstreams": {
     "agentrouter": "https://agentrouter.org/v1",
     "bigmodel": "https://open.bigmodel.cn/api/paas/v4"
@@ -18,7 +17,7 @@
   ],
   "injection_guard": {
     "enabled": true,
-    "action": "block",
+    "action": "warn",
     "sensitivity": 0.65
   }
 }

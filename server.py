@@ -2,7 +2,9 @@ import json
 import os
 import re
 import sys
+import hmac
 import codecs
+import secrets
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
@@ -36,11 +38,13 @@ BOLD = "\033[1m"
 RESET = "\033[0m"
 
 # Load config
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
+TOKEN_FILE = os.path.join(PROXY_DIR, ".vault_token")
+
 config: Dict[str, Any] = {
     "host": "127.0.0.1",
     "port": 8765,
-    "vault_token": "zvault_sec_local_d98f7e2a4b1c8360",
     "upstreams": {
         "agentrouter": "https://agentrouter.org/v1",
         "bigmodel": "https://open.bigmodel.cn/api/paas/v4"
@@ -61,25 +65,61 @@ if os.path.exists(CONFIG_FILE):
     except Exception as e:
         print(f"[WARN] Error reading config.json: {e}")
 
+
+def get_or_generate_vault_token() -> str:
+    """
+    Retrieves or generates a secure random vault token.
+    Token is stored in .vault_token (git-ignored) with chmod 600.
+    """
+    token = config.get("vault_token")
+    if token and not token.startswith("zvault_sec_local_d98f"):
+        return token
+
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                saved = f.read().strip()
+                if saved:
+                    return saved
+        except Exception:
+            pass
+
+    # Generate a strong unique token
+    new_token = f"zv_{secrets.token_hex(24)}"
+    try:
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(new_token)
+        if hasattr(os, "chmod") and sys.platform != "win32":
+            try:
+                os.chmod(TOKEN_FILE, 0o600)
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[WARN] Failed to write .vault_token file: {e}")
+
+    return new_token
+
+
+CURRENT_VAULT_TOKEN = get_or_generate_vault_token()
+
 # Initialize Vault & Injection Guard
-secrets_path = os.path.join(os.path.dirname(__file__), config.get("secrets_file", "secrets.json"))
+secrets_path = os.path.join(PROXY_DIR, config.get("secrets_file", "secrets.json"))
 env_files = config.get("env_files", [".env"])
 vault = SecretVault(secrets_path, env_files=env_files)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
-injection_cfg = config.get("injection_guard", {"enabled": True, "action": "block", "sensitivity": 0.65})
+injection_cfg = config.get("injection_guard", {"enabled": True, "action": "warn", "sensitivity": 0.65})
 injection_guard = PromptInjectionGuard(sensitivity=float(injection_cfg.get("sensitivity", 0.65)))
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Persistent AsyncClient to avoid creating new connections on every request
     app.state.client = httpx.AsyncClient(timeout=180.0, follow_redirects=False)
     yield
     await app.state.client.aclose()
 
 
-app = FastAPI(title="ZCode Secret Masking Proxy", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="ZCode Secret Masking Proxy", version="1.1.1", lifespan=lifespan)
 
 
 def log_shield(msg: str):
@@ -97,10 +137,6 @@ def log_warn(msg: str):
 
 @app.middleware("http")
 async def dns_rebinding_protection(request: Request, call_next):
-    """
-    Protects against DNS rebinding attacks by validating the incoming Host header.
-    Only allows local loopback and the explicitly configured binding host.
-    """
     host_header = request.headers.get("host", "")
     req_host = host_header.split(":")[0].strip().lower()
     configured_host = str(config.get("host", "127.0.0.1")).lower()
@@ -116,58 +152,63 @@ async def dns_rebinding_protection(request: Request, call_next):
 
 def verify_vault_token(request: Request):
     """
-    Authenticates requests to management and test endpoints (/vault/*, /test-echo).
+    Authenticates requests to management and test endpoints (/vault/*, /test-echo)
+    using constant-time comparison to prevent timing attacks.
     """
-    expected_token = config.get("vault_token")
-    if not expected_token:
-        return
-
     token = request.headers.get("X-Vault-Token")
     if not token:
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             token = auth_header[7:].strip()
 
-    if token != expected_token:
+    if not token or not hmac.compare_digest(token, CURRENT_VAULT_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized: valid X-Vault-Token required")
 
 
 def check_domain_allowed(target_url: str) -> bool:
     """
-    Strictly validates target host:
+    Validates target URL:
     - Rejects credentials (userinfo) in authority
+    - Enforces https:// scheme (except for local testing on 127.0.0.1/localhost)
+    - Validates target hostname format strictly against regex [a-zA-Z0-9.-]+
     - Matches hostname against explicit allowed_hosts whitelist
-    - Disallows forwarding if whitelist is empty
     """
     parsed = urlparse(target_url)
     if parsed.username or parsed.password:
         log_warn(f"Target URL '{target_url}' contains credentials in authority! Request blocked.")
         return False
 
+    scheme = (parsed.scheme or "").lower()
     target_host = (parsed.hostname or "").lower()
+
+    if not target_host or not re.match(r"^[a-z0-9.-]+$", target_host):
+        log_warn(f"Invalid target hostname format: '{target_host}'")
+        return False
+
+    # Disallow unencrypted http:// for external upstreams
+    if scheme != "https" and target_host not in ("127.0.0.1", "localhost"):
+        log_warn(f"Unencrypted HTTP upstream disallowed for security: '{target_url}'")
+        return False
+
     allowed = config.get("allowed_hosts", [])
-    if not allowed or not target_host:
+    if not allowed:
         return False
 
     return any(target_host == a.lower() or target_host.endswith("." + a.lower()) for a in allowed)
 
 
 def resolve_target_url(upstream_name_or_scheme: str, subpath: str) -> str:
-    """Resolves target URL based on upstream alias or explicit scheme/host."""
     upstreams = config.get("upstreams", {})
 
-    # Case 1: Known named upstream (e.g. /agentrouter/chat/completions)
     if upstream_name_or_scheme in upstreams:
         base_url = upstreams[upstream_name_or_scheme].rstrip("/")
         subpath = subpath.lstrip("/")
 
-        # Handle deduplication of /v1 if base ends in /v1 and subpath starts with v1/
         if base_url.endswith("/v1") and subpath.startswith("v1/"):
             subpath = subpath[3:]
 
         return f"{base_url}/{subpath}" if subpath else base_url
 
-    # Case 2: Explicit scheme (e.g. /proxy/https/agentrouter.org/v1/chat/completions)
     if upstream_name_or_scheme in ("http", "https"):
         scheme = upstream_name_or_scheme
         return f"{scheme}://{subpath}"
@@ -181,11 +222,10 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
 
     if not check_domain_allowed(target_url):
         log_warn(f"Target URL '{target_url}' is NOT in allowed_hosts list! Request blocked for security.")
-        raise HTTPException(status_code=403, detail="Target host not in allowed_hosts")
+        raise HTTPException(status_code=403, detail="Target host not in allowed_hosts or invalid")
 
     log_shield(f"{request.method} -> {target_url}")
 
-    # 1. Read and mask request body (Fail-Closed)
     raw_body = await request.body()
     masked_body = raw_body
 
@@ -193,12 +233,11 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
         try:
             body_json = json.loads(raw_body.decode("utf-8"))
 
-            # Scan for prompt injections & jailbreaks
+            # Deep-scan entire payload for prompt injections & jailbreaks
             if injection_cfg.get("enabled", True):
-                msgs = body_json.get("messages", body_json.get("input", []))
-                inj_res = injection_guard.scan_messages(msgs)
+                inj_res = injection_guard.scan_payload(body_json)
                 if inj_res.is_malicious:
-                    action = injection_cfg.get("action", "block").lower()
+                    action = injection_cfg.get("action", "warn").lower()
                     if action == "block":
                         log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
                         raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
@@ -212,7 +251,6 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
         except HTTPException:
             raise
         except Exception:
-            # Fallback to plain text masking; fail closed if text masking also fails
             try:
                 body_str = raw_body.decode("utf-8")
                 masked_str, count = vault.mask_text(body_str)
@@ -263,7 +301,6 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                 decoder = codecs.getincrementaldecoder("utf-8")()
                 try:
                     async for chunk_bytes in upstream_resp.aiter_bytes():
-                        # Incremental UTF-8 decoder prevents corrupted multibyte characters (Cyrillic, emojis)
                         chunk_str = decoder.decode(chunk_bytes, final=False)
                         if chunk_str:
                             demasked_part = sse_demasker.process_raw_chunk(chunk_str)
@@ -363,7 +400,6 @@ async def add_secret_endpoint(request: Request):
     already_existed = secret in vault.secret_to_placeholder
     placeholder = vault.register_secret(secret, label)
 
-    # Persist to secrets.json
     try:
         stored = {}
         if os.path.exists(secrets_path):
@@ -372,6 +408,11 @@ async def add_secret_endpoint(request: Request):
         stored[placeholder] = secret
         with open(secrets_path, "w", encoding="utf-8") as f:
             json.dump(stored, f, indent=2, ensure_ascii=False)
+        if hasattr(os, "chmod") and sys.platform != "win32":
+            try:
+                os.chmod(secrets_path, 0o600)
+            except Exception:
+                pass
     except Exception as e:
         log_warn(f"Failed to persist secret to secrets.json: {e}")
 
@@ -396,7 +437,6 @@ async def add_env_endpoint(request: Request):
 
     loaded_count = vault.load_env_file(path)
 
-    # Persist to config.json if not already present
     env_list = config.setdefault("env_files", [])
     if path not in env_list:
         env_list.append(path)
@@ -421,8 +461,7 @@ async def test_echo(request: Request):
     raw_body = await request.body()
     try:
         body_json = json.loads(raw_body.decode("utf-8"))
-        msgs = body_json.get("messages", body_json.get("input", []))
-        inj_res = injection_guard.scan_messages(msgs)
+        inj_res = injection_guard.scan_payload(body_json)
 
         masked_json, mask_count = vault.mask_payload(body_json)
         _, demask_count = vault.demask_payload(masked_json)
@@ -445,15 +484,12 @@ async def test_echo(request: Request):
         return {"error": str(e)}
 
 
-# Universal proxy route: /proxy/https/agentrouter.org/v1/chat/completions
 @app.api_route("/proxy/{scheme}/{subpath:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def universal_proxy(scheme: str, subpath: str, request: Request):
     target_url = resolve_target_url(scheme, subpath)
     return await proxy_request_handler(target_url, request)
 
 
-# Named upstream route: /{upstream_name}/{subpath:path}
-# e.g. /agentrouter/v1/chat/completions
 @app.api_route("/{upstream_name}/{subpath:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"])
 async def named_upstream_proxy(upstream_name: str, subpath: str, request: Request):
     if upstream_name in config.get("upstreams", {}):
@@ -466,7 +502,7 @@ if __name__ == "__main__":
     host = config.get("host", "127.0.0.1")
     port = int(config.get("port", 8765))
     print(f"\n{CYAN}{BOLD}=================================================={RESET}")
-    print(f"{CYAN}{BOLD}   🛡️  ZCode Secret Masking Proxy v1.1.0   {RESET}")
+    print(f"{CYAN}{BOLD}   🛡️  ZCode Secret Masking Proxy v1.1.1   {RESET}")
     print(f"{CYAN}{BOLD}=================================================={RESET}")
     print(f"Server starting on: {GREEN}http://{host}:{port}{RESET}")
     print(f"Registered upstreams: {YELLOW}{list(config.get('upstreams', {}).keys())}{RESET}")

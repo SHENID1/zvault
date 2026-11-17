@@ -7,3 +7,4 @@ err.txt
 .env
 *.env
 secrets.json
+.vault_token

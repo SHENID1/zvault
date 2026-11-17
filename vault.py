@@ -23,10 +23,9 @@ IGNORE_ENV_KEYS = {
     "PATH", "SHELL", "USER", "HOME", "HOSTNAME"
 }
 
-# System keys in LLM JSON payloads that should NOT be masked by entropy/regex
+# Strictly narrowed system keys in LLM JSON payloads that should NOT be masked by entropy/regex
 SYSTEM_SAFE_KEYS = {
-    "id", "tool_call_id", "model", "signature", "encrypted_content",
-    "type", "role", "index", "object", "finish_reason", "status"
+    "id", "tool_call_id", "call_id"
 }
 
 
@@ -135,7 +134,7 @@ class SecretVault:
         """
         Loads static secrets from JSON or line-based text file.
         Strict schema: JSON key is ALWAYS the label/placeholder, and value is ALWAYS the secret.
-        No direction heuristics based on string length!
+        Only non-empty string values are registered. Booleans and numbers are ignored.
         """
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -146,10 +145,14 @@ class SecretVault:
                 if content.startswith("{"):
                     data = json.loads(content)
                     for k, v in data.items():
+                        # Disallow booleans, integers, floats, None from becoming secrets!
+                        if isinstance(v, bool):
+                            continue
                         if isinstance(v, str) and v.strip():
-                            self.register_secret(v.strip(), k.strip())
-                        elif isinstance(v, (int, float, bool)):
-                            self.register_secret(str(v), k.strip())
+                            # Don't register "true", "false", "null"
+                            if v.strip().lower() in ("true", "false", "null", "undefined"):
+                                continue
+                            self.register_secret(v.strip(), str(k).strip())
                 else:
                     for line in content.splitlines():
                         line = line.strip()
@@ -195,13 +198,6 @@ class SecretVault:
         return placeholder
 
     def scan_and_register_dynamic(self, text: str) -> List[Tuple[str, str]]:
-        """
-        Smart Scanner:
-        1. Contextual assignments (e.g. token = "...", password: "...")
-        2. Known signatures (OpenAI, Anthropic, Google, AWS, GitHub, etc.)
-        3. Shannon Entropy analysis for high-randomness strings (excluding IDs)
-        4. IPv4 / IPv6 validation via standard library
-        """
         found = []
 
         # 1. Contextual assignments in code or JSON
@@ -241,7 +237,6 @@ class SecretVault:
                 continue
             # Must contain both letters and digits
             if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
-                # Ignore URLs, paths or package names
                 if not token.startswith("http") and "/" not in token:
                     h = calculate_shannon_entropy(token)
                     if h >= 4.15:
@@ -253,12 +248,10 @@ class SecretVault:
             ip = m.group(1)
             if ip in self.ipv4_exempt or ip in self.secret_to_placeholder or ip.startswith("__VAULT_"):
                 continue
-            # Ignore if part of a version string like v1.2.3.4
             start_pos = m.start()
             if start_pos > 0 and text[start_pos - 1] in ("v", "V", "/"):
                 continue
 
-            # Classify local subnet vs public IP
             clean_ip = ip.split("/")[0]
             if clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", clean_ip):
                 ph = self.register_secret(ip, "LOCAL_IP")
@@ -269,12 +262,10 @@ class SecretVault:
         # 6. IPv6 Addresses (Validated strictly with ipaddress module)
         for m in self.ipv6_candidate_pattern.finditer(text):
             cand = m.group(1)
-            # Must have at least two colons
             if cand.count(":") < 2:
                 continue
             try:
                 ip_obj = ipaddress.IPv6Address(cand)
-                # Ignore loopback (::1) and unspecified (::)
                 if ip_obj.is_loopback or ip_obj.is_unspecified:
                     continue
                 if cand in self.secret_to_placeholder or cand.startswith("__VAULT_"):
@@ -282,7 +273,6 @@ class SecretVault:
                 ph = self.register_secret(cand, "IPV6_ADDR")
                 found.append((cand, ph))
             except ValueError:
-                # Not a valid IPv6 address (e.g. timestamp 12:30:45, MAC address)
                 continue
 
         return found
@@ -297,7 +287,6 @@ class SecretVault:
         replacements = 0
         masked = text
 
-        # Sort secrets by length descending to avoid partial prefix collisions
         sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
         for secret in sorted_secrets:
             if secret in masked:
@@ -325,7 +314,6 @@ class SecretVault:
             new_dict = {}
             total_replacements = 0
             for k, v in data.items():
-                # Skip masking system identification keys like id, tool_call_id, model
                 if k in SYSTEM_SAFE_KEYS:
                     new_dict[k] = v
                     continue
@@ -336,10 +324,7 @@ class SecretVault:
         return data, 0
 
     def demask_text(self, text: str, json_escaped: bool = False) -> Tuple[str, int]:
-        """
-        Restores placeholders in text back to real secrets.
-        If json_escaped is True, replaces with JSON-escaped string literal (e.g. \n -> \\n, " -> \").
-        """
+        """Restores placeholders in text back to real secrets."""
         if not text:
             return text, 0
 
@@ -352,7 +337,6 @@ class SecretVault:
                 count = result.count(placeholder)
                 if count > 0:
                     if json_escaped:
-                        # Escapes special characters properly for inclusion inside JSON strings
                         replacement = json.dumps(real_secret)[1:-1]
                     else:
                         replacement = real_secret
@@ -386,10 +370,7 @@ class SecretVault:
         return data, 0
 
     def demask_json_str(self, text: str) -> Tuple[str, int]:
-        """
-        Safely demasks a JSON string by parsing it into structured Python objects first,
-        guaranteeing that secrets with quotes or newlines do not produce invalid JSON control characters.
-        """
+        """Safely demasks a JSON string by parsing it into structured Python objects first."""
         try:
             parsed = json.loads(text)
             demasked_obj, count = self.demask_payload(parsed)
@@ -401,7 +382,9 @@ class SecretVault:
 class TextStreamDemasker:
     """
     Stateful buffer for continuous text stream (e.g. delta field inside SSE).
-    Buffers only when an unclosed '__' placeholder prefix is detected at the tail.
+    Buffers ONLY when a genuine unclosed placeholder prefix (e.g. '__VAULT_API')
+    is detected at the tail of the stream.
+    Valid unclosed placeholder prefixes must strictly match ^__[A-Za-z0-9_]*$ without spaces.
     """
     def __init__(self, vault: SecretVault, max_placeholder_len: int = 40, json_escaped: bool = False):
         self.vault = vault
@@ -427,17 +410,25 @@ class TextStreamDemasker:
             self.buffer = ""
             return to_emit
 
-        # There is a '__'
         tail = self.buffer[last_double_underscore:]
 
-        # If tail starts with '__' and doesn't contain a closing '__' (after the first 2 chars)
-        # and tail length is less than max_placeholder_len, hold tail back
-        if tail.startswith("__") and tail[2:].find("__") == -1 and len(tail) < self.max_placeholder_len:
+        # A valid unclosed placeholder prefix MUST:
+        # 1. Start with '__'
+        # 2. Contain only alphanumeric chars and underscores (NO spaces, punctuation, etc.)
+        # 3. Not have a closing '__' after the first 2 characters
+        # 4. Be shorter than max_placeholder_len
+        is_candidate_prefix = (
+            re.match(r"^__[A-Za-z0-9_]*$", tail) is not None
+            and tail[2:].find("__") == -1
+            and len(tail) < self.max_placeholder_len
+        )
+
+        if is_candidate_prefix:
             to_emit = self.buffer[:last_double_underscore]
             self.buffer = tail
             return to_emit
 
-        # Otherwise, whatever is in buffer is either closed or too long to be a placeholder
+        # Otherwise, the tail is NOT an unclosed placeholder (e.g. '__ now' or complete word)
         to_emit = self.buffer
         self.buffer = ""
         return to_emit
@@ -451,11 +442,8 @@ class TextStreamDemasker:
 class SSEStreamDemasker:
     """
     Universal Demasker for Server-Sent Events (SSE).
-    Supports:
-    1. OpenAI Realtime / Responses API (`openai-responses` format: `response.output_text.delta`, `response.function_call_arguments.delta`)
-    2. OpenAI Chat Completions (`choices[].delta.content`, `reasoning_content`, `tool_calls[].function.arguments`)
-    3. Anthropic (`type: content_block_delta`, `delta.text`, `delta.partial_json`)
-    4. Arbitrary JSON text fields and fallback raw SSE streams
+    Supports OpenAI Chat Completions, Responses API, Anthropic, and streaming tool calls.
+    Flushes buffers proactively on finish_reason, content_block_stop, and [DONE].
     """
     def __init__(self, vault: SecretVault):
         self.vault = vault
@@ -487,7 +475,6 @@ class SSEStreamDemasker:
                 data_str = line[5:].strip()
 
                 if data_str == "[DONE]":
-                    # Flush all buffers before [DONE]
                     flushed = self.flush_internal()
                     if flushed:
                         output.append(flushed)
@@ -498,11 +485,10 @@ class SSEStreamDemasker:
                     event_data = json.loads(data_str)
                     modified = False
 
-                    # 1. Format: OpenAI Responses API
                     if isinstance(event_data, dict):
                         ev_type = event_data.get("type", "")
 
-                        # Text delta
+                        # 1. OpenAI Responses API
                         if "delta" in event_data and isinstance(event_data["delta"], str):
                             if ev_type == "response.function_call_arguments.delta":
                                 call_id = event_data.get("call_id", "default")
@@ -513,12 +499,14 @@ class SSEStreamDemasker:
                             self.last_responses_event = dict(event_data)
                             modified = True
 
-                        # 2. Format: OpenAI Chat Completions (choices -> delta)
+                        # 2. OpenAI Chat Completions (choices -> delta)
                         elif "choices" in event_data and isinstance(event_data["choices"], list):
                             self.saw_choices = True
                             for choice in event_data.get("choices", []):
                                 c_idx = choice.get("index", 0)
                                 delta = choice.get("delta", {})
+                                finish_reason = choice.get("finish_reason")
+
                                 if isinstance(delta, dict):
                                     if "content" in delta and isinstance(delta["content"], str):
                                         delta["content"] = self.content_demasker.process(delta["content"])
@@ -526,7 +514,6 @@ class SSEStreamDemasker:
                                     if "reasoning_content" in delta and isinstance(delta["reasoning_content"], str):
                                         delta["reasoning_content"] = self.reasoning_demasker.process(delta["reasoning_content"])
                                         modified = True
-                                    # Support tool_calls arguments streaming in OpenAI format
                                     if "tool_calls" in delta and isinstance(delta["tool_calls"], list):
                                         for tc in delta["tool_calls"]:
                                             tc_idx = tc.get("index", 0)
@@ -537,7 +524,17 @@ class SSEStreamDemasker:
                                                 func["arguments"] = tc_demasker.process(func["arguments"])
                                                 modified = True
 
-                        # 3. Format: Anthropic (content_block_delta -> delta.text or delta.partial_json)
+                                # Proactively flush held buffer when finish_reason arrives
+                                if finish_reason is not None:
+                                    flushed_c = self.content_demasker.flush()
+                                    if flushed_c:
+                                        if "delta" in choice and "content" in choice["delta"]:
+                                            choice["delta"]["content"] = (choice["delta"]["content"] or "") + flushed_c
+                                        else:
+                                            choice.setdefault("delta", {})["content"] = flushed_c
+                                        modified = True
+
+                        # 3. Anthropic format
                         elif "delta" in event_data and isinstance(event_data["delta"], dict):
                             delta_obj = event_data["delta"]
                             block_idx = event_data.get("index", 0)
@@ -550,18 +547,38 @@ class SSEStreamDemasker:
                                 delta_obj["partial_json"] = tc_demasker.process(delta_obj["partial_json"])
                                 modified = True
 
-                    # 4. Universal fallback: recursive string demasking for other JSON payloads
+                        # Anthropic content_block_stop / message_stop: proactively flush held text
+                        elif ev_type in ("content_block_stop", "message_stop"):
+                            block_idx = event_data.get("index", 0)
+                            flushed_c = self.content_demasker.flush()
+                            tc_key = f"anthropic_block_{block_idx}"
+                            flushed_tc = self.stream_demaskers[tc_key].flush() if tc_key in self.stream_demaskers else ""
+
+                            if flushed_c:
+                                synth = {
+                                    "type": "content_block_delta",
+                                    "index": block_idx,
+                                    "delta": {"type": "text_delta", "text": flushed_c}
+                                }
+                                output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+
+                            if flushed_tc:
+                                synth_tc = {
+                                    "type": "content_block_delta",
+                                    "index": block_idx,
+                                    "delta": {"type": "input_json_delta", "partial_json": flushed_tc}
+                                }
+                                output.append(f"data: {json.dumps(synth_tc, ensure_ascii=False)}\n\n")
+
                     if not modified and isinstance(event_data, (dict, list)):
                         event_data, _ = self.vault.demask_payload(event_data)
 
                     output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n")
 
                 except Exception:
-                    # Non-JSON data line: fallback direct text demask
                     demasked_line, _ = self.vault.demask_text(line)
                     output.append(demasked_line + "\n")
             else:
-                # Other SSE headers (event:, id:, retry:, etc.)
                 demasked_line, _ = self.vault.demask_text(line)
                 output.append(demasked_line + "\n")
 
@@ -579,11 +596,9 @@ class SSEStreamDemasker:
                 synth = {"choices": [{"index": 0, "delta": {"content": flushed_content}}]}
                 output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
 
-        # Flush any remaining tool call / stream buffers
         for key, demasker in list(self.stream_demaskers.items()):
             flushed_extra = demasker.flush()
             if flushed_extra:
-                # If Anthropic block
                 if key.startswith("anthropic_block_"):
                     try:
                         b_idx = int(key.split("_")[-1])
