@@ -8,3 +8,6 @@ err.txt
 *.env
 secrets.json
 .vault_token
+.vault_state.json
+*.state.json
+

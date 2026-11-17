@@ -5,21 +5,21 @@ import sys
 import hmac
 import codecs
 import secrets
+import asyncio
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
 
 # Ensure sys.stdout and sys.stderr are valid when running in background under pythonw
-if sys.stdout is None:
+if sys.stdout is None or sys.stderr is None:
     try:
-        sys.stdout = open(os.path.join(os.path.dirname(__file__), "proxy.log"), "a", encoding="utf-8")
+        _log_f = open(os.path.join(os.path.dirname(__file__), "proxy.log"), "a", encoding="utf-8", buffering=1)
     except Exception:
-        sys.stdout = open(os.devnull, "w")
-if sys.stderr is None:
-    try:
-        sys.stderr = open(os.path.join(os.path.dirname(__file__), "proxy.log"), "a", encoding="utf-8")
-    except Exception:
-        sys.stderr = open(os.devnull, "w")
+        _log_f = open(os.devnull, "w")
+    if sys.stdout is None:
+        sys.stdout = _log_f
+    if sys.stderr is None:
+        sys.stderr = _log_f
 
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import StreamingResponse
@@ -41,6 +41,10 @@ RESET = "\033[0m"
 PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
 TOKEN_FILE = os.path.join(PROXY_DIR, ".vault_token")
+DEFAULT_CONFIG_TOKEN_PREFIX = "zvault_sec_local_d98f"
+
+# Async lock for safe serialized file persistence
+file_write_lock = asyncio.Lock()
 
 config: Dict[str, Any] = {
     "host": "127.0.0.1",
@@ -86,7 +90,7 @@ def get_or_generate_vault_token() -> str:
 
     # 2. Check config.json
     cfg_token = config.get("vault_token")
-    if cfg_token and not cfg_token.startswith("zvault_sec_local_d98f"):
+    if cfg_token and not cfg_token.startswith(DEFAULT_CONFIG_TOKEN_PREFIX):
         return cfg_token
 
     # 3. Generate a strong unique token and create file with 0o600 atomically
@@ -111,8 +115,9 @@ CURRENT_VAULT_TOKEN = get_or_generate_vault_token()
 
 # Initialize Vault & Injection Guard
 secrets_path = os.path.join(PROXY_DIR, config.get("secrets_file", "secrets.json"))
+state_file_path = os.path.join(PROXY_DIR, config.get("state_file", ".vault_state.json"))
 env_files = config.get("env_files", [".env"])
-vault = SecretVault(secrets_path, env_files=env_files)
+vault = SecretVault(secrets_path, env_files=env_files, state_file=state_file_path)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
 injection_cfg = config.get("injection_guard", {"enabled": True, "action": "warn", "sensitivity": 0.65})
@@ -407,21 +412,23 @@ async def add_secret_endpoint(request: Request):
     already_existed = secret in vault.secret_to_placeholder
     placeholder = vault.register_secret(secret, label)
 
-    try:
-        stored = {}
-        if os.path.exists(secrets_path):
-            with open(secrets_path, "r", encoding="utf-8") as f:
-                stored = json.load(f)
-        stored[placeholder] = secret
-        with open(secrets_path, "w", encoding="utf-8") as f:
-            json.dump(stored, f, indent=2, ensure_ascii=False)
-        if hasattr(os, "chmod") and sys.platform != "win32":
-            try:
-                os.chmod(secrets_path, 0o600)
-            except Exception:
-                pass
-    except Exception as e:
-        log_warn(f"Failed to persist secret to secrets.json: {e}")
+    async with file_write_lock:
+        try:
+            stored = {}
+            if os.path.exists(secrets_path):
+                with open(secrets_path, "r", encoding="utf-8") as f:
+                    stored = json.load(f)
+            stored_key = label if (label and not label.startswith("__")) else placeholder
+            stored[stored_key] = secret
+            with open(secrets_path, "w", encoding="utf-8") as f:
+                json.dump(stored, f, indent=2, ensure_ascii=False)
+            if hasattr(os, "chmod") and sys.platform != "win32":
+                try:
+                    os.chmod(secrets_path, 0o600)
+                except Exception:
+                    pass
+        except Exception as e:
+            log_warn(f"Failed to persist secret to secrets.json: {e}")
 
     log_shield(f"Registered secret string -> {placeholder} (Existing: {already_existed})")
 
@@ -444,14 +451,15 @@ async def add_env_endpoint(request: Request):
 
     loaded_count = vault.load_env_file(path)
 
-    env_list = config.setdefault("env_files", [])
-    if path not in env_list:
-        env_list.append(path)
-        try:
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(config, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            log_warn(f"Failed to update config.json: {e}")
+    async with file_write_lock:
+        env_list = config.setdefault("env_files", [])
+        if path not in env_list:
+            env_list.append(path)
+            try:
+                with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                    json.dump(config, f, indent=2, ensure_ascii=False)
+            except Exception as e:
+                log_warn(f"Failed to update config.json: {e}")
 
     log_shield(f"Dynamically registered .env: {path} (+{loaded_count} secrets)")
     return {

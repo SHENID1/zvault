@@ -17,11 +17,16 @@ INVISIBLE_CHARS = [
 ]
 INVISIBLE_REGEX = re.compile("[" + "".join(INVISIBLE_CHARS) + "]")
 
-# Homoglyph translation table (Cyrillic lookalikes -> Latin equivalents)
-CYRILLIC_TO_LATIN = str.maketrans({
+# Homoglyph translation table (Cyrillic & Greek lookalikes -> Latin equivalents)
+HOMOGLYPH_TO_LATIN = str.maketrans({
+    # Cyrillic lookalikes
     'а': 'a', 'с': 'c', 'е': 'e', 'о': 'o', 'р': 'p', 'х': 'x', 'у': 'y', 'і': 'i', 'ј': 'j', 'ѕ': 's',
-    'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H', 'К': 'K', 'М': 'M', 'О': 'O', 'Р': 'P', 'Т': 'T', 'Х': 'X'
+    'А': 'A', 'В': 'B', 'С': 'C', 'Е': 'E', 'Н': 'H', 'К': 'K', 'М': 'M', 'О': 'O', 'Р': 'P', 'Т': 'T', 'Х': 'X',
+    # Greek lookalikes
+    'α': 'a', 'β': 'b', 'γ': 'g', 'ε': 'e', 'ι': 'i', 'κ': 'k', 'ν': 'v', 'ο': 'o', 'ρ': 'p', 'τ': 't', 'υ': 'u', 'χ': 'x',
+    'Α': 'A', 'Β': 'B', 'Ε': 'E', 'Ζ': 'Z', 'Η': 'H', 'Ι': 'I', 'Κ': 'K', 'Μ': 'M', 'Ν': 'N', 'Ο': 'O', 'Ρ': 'P', 'Τ': 'T', 'Υ': 'Y'
 })
+CYRILLIC_TO_LATIN = HOMOGLYPH_TO_LATIN
 
 @dataclass
 class InjectionResult:
@@ -62,7 +67,7 @@ class PromptInjectionGuard:
 
         # 4. System prompt & secret exfiltration leaks (EN & RU)
         self.prompt_leak_patterns = [
-            (r"(?i)\b(?:repeat|reveal|print|output|display|show|dump)\b[\s\S]{0,30}\b(?:your\s+)?(?:system\s+prompt|initial\s+instructions?|instructions?\s+above|hidden\s+prompt)\b", "PROMPT_LEAK"),
+            (r"(?i)\b(?:repeat|reveal|print|output|display|show|dump)\b[\s\S]{0,40}\b(?:your\s+)?(?:initial|original|core|hidden|system)?\s*(?:system\s+)?(?:prompt|instructions?|directives?)\b", "PROMPT_LEAK"),
             (r"(?i)\bwhat\s+(?:are|were)\s+your\s+(?:original|initial|system)\s+(?:instructions?|prompts?)\b", "PROMPT_LEAK"),
             (r"(?i)\boutput\s+everything\s+starting\s+with\s+[\"']?(?:you\s+are|<\|im_start\|>)\b", "PROMPT_LEAK"),
             (r"(?i)\b(?:выведи|покажи|распечатай|повтори)\s+(?:свой\s+)?(?:системный\s+промпт|исходные\s+инструкции|инструкции\s+выше)\b", "PROMPT_LEAK_RU"),
@@ -95,23 +100,38 @@ class PromptInjectionGuard:
         has_invisible = bool(INVISIBLE_REGEX.search(text))
         cleaned = INVISIBLE_REGEX.sub("", text)
         normalized = unicodedata.normalize("NFKD", cleaned)
-        latin_normalized = normalized.translate(CYRILLIC_TO_LATIN)
+        latin_normalized = normalized.translate(HOMOGLYPH_TO_LATIN)
         return normalized, latin_normalized, has_invisible
 
     def scan_base64_payloads(self, text: str) -> List[Tuple[str, str]]:
         findings = []
-        b64_candidates = re.findall(r"(?:^|\s|[\"'])((?:[A-Za-z0-9+/]{4}){4,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?)(?:$|\s|[\"'])", text)
+        # Support both standard Base64 (+/) and URL-safe Base64 (-_), with optional padding
+        b64_candidates = re.findall(r"(?:^|[\s\"':=])([A-Za-z0-9+/\-_]{16,}={0,2})(?:$|[\s\"';,])", text)
 
-        all_patterns = self.override_patterns + self.override_patterns_ru + self.jailbreak_patterns
-        for b64_str in b64_candidates:
+        all_patterns = (
+            self.override_patterns +
+            self.override_patterns_ru +
+            self.jailbreak_patterns +
+            self.prompt_leak_patterns +
+            self.destructive_shell_patterns
+        )
+        for candidate in b64_candidates:
+            clean_b64 = re.sub(r"\s+", "", candidate)
+            # URL-safe -> standard base64 translation
+            std_b64 = clean_b64.translate(str.maketrans("-_", "+/"))
+            pad_len = (4 - len(std_b64) % 4) % 4
+            std_b64 += "=" * pad_len
+
             try:
-                decoded_bytes = base64.b64decode(b64_str, validate=True)
+                decoded_bytes = base64.b64decode(std_b64, validate=True)
                 decoded_text = decoded_bytes.decode("utf-8", errors="ignore")
                 if len(decoded_text) >= 10:
                     norm, lat_norm, _ = self.normalize(decoded_text)
                     for pattern, label in all_patterns:
-                        if re.search(pattern, norm) or re.search(pattern, lat_norm):
-                            findings.append((b64_str, f"BASE64_OBFUSCATED_{label}"))
+                        if (re.search(pattern, decoded_text) or
+                            re.search(pattern, norm) or
+                            re.search(pattern, lat_norm)):
+                            findings.append((candidate, f"BASE64_OBFUSCATED_{label}"))
                             break
             except Exception:
                 pass
@@ -133,7 +153,7 @@ class PromptInjectionGuard:
         # 1. Base64 obfuscated payloads
         b64_findings = self.scan_base64_payloads(text)
         if b64_findings:
-            base_score += 0.6
+            base_score = max(base_score, 0.75)
             for _, tag in b64_findings:
                 matched.append(tag)
                 highest_category = tag
@@ -145,7 +165,7 @@ class PromptInjectionGuard:
             (self.override_patterns_ru, 0.75),
             (self.jailbreak_patterns, 0.70),
             (self.role_spoofing_patterns, 0.65),
-            (self.prompt_leak_patterns, 0.50),
+            (self.prompt_leak_patterns, 0.65),
         ]
 
         for patterns, weight in pattern_groups:

@@ -1,6 +1,8 @@
 import re
 import json
 import os
+import sys
+import time
 import math
 import ipaddress
 from collections import Counter
@@ -54,10 +56,14 @@ def _skip_symmetric(node: Dict[str, Any], key: str) -> bool:
 
 
 class SecretVault:
-    def __init__(self, secrets_file: Optional[str] = None, env_files: Optional[List[str]] = None):
+    def __init__(self, secrets_file: Optional[str] = None, env_files: Optional[List[str]] = None,
+                 state_file: Optional[str] = None, state_ttl: int = 86400):
         self.secrets_file = secrets_file
+        self.state_file = state_file
+        self.state_ttl = state_ttl
         self.secret_to_placeholder: Dict[str, str] = {}
         self.placeholder_to_secret: Dict[str, str] = {}
+        self.dynamic_secrets: Dict[str, Dict[str, Any]] = {}
         self._next_id = 1
         self.on_demask: Optional[Callable[[str, str], None]] = None
         self.on_mask: Optional[Callable[[str, str], None]] = None
@@ -122,6 +128,9 @@ class SecretVault:
                 if os.path.exists(ef):
                     self.load_env_file(ef)
 
+        if self.state_file and os.path.exists(self.state_file):
+            self.load_state()
+
     def load_env_file(self, path: str) -> int:
         """Loads secrets from a .env file, ignoring non-sensitive config keys."""
         loaded = 0
@@ -179,7 +188,70 @@ class SecretVault:
         except Exception as e:
             print(f"[Vault] Error loading secrets from {path}: {e}")
 
-    def register_secret(self, secret: str, label: Optional[str] = None) -> str:
+    def load_state(self):
+        """Loads dynamically registered secrets from state_file, discarding expired entries."""
+        if not self.state_file or not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if not content:
+                    return
+                data = json.loads(content)
+                now = time.time()
+                loaded_count = 0
+                for ph, info in data.items():
+                    if isinstance(info, dict):
+                        secret = info.get("secret")
+                        ts = float(info.get("ts", 0))
+                        label = info.get("label")
+                    else:
+                        secret = str(info)
+                        ts = now
+                        label = None
+
+                    if not secret:
+                        continue
+
+                    if self.state_ttl > 0 and (now - ts) > self.state_ttl:
+                        continue
+
+                    self.secret_to_placeholder[secret] = ph
+                    self.placeholder_to_secret[ph] = secret
+                    self.dynamic_secrets[ph] = {"secret": secret, "ts": ts, "label": label}
+                    loaded_count += 1
+
+                    m = re.search(r"_(\d+)__$", ph)
+                    if m:
+                        idx = int(m.group(1))
+                        if idx >= self._next_id:
+                            self._next_id = idx + 1
+
+                if loaded_count > 0:
+                    print(f"[Vault] Restored {loaded_count} dynamic secret mapping(s) from state file.")
+        except Exception as e:
+            print(f"[Vault] Error loading state file: {e}")
+
+    def save_state(self):
+        """Persists dynamic secret mappings to state_file atomically with 0o600 permissions."""
+        if not self.state_file or not self.dynamic_secrets:
+            return
+        try:
+            tmp_path = f"{self.state_file}.tmp_{os.getpid()}"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(self.dynamic_secrets, f, indent=2, ensure_ascii=False)
+
+            if hasattr(os, "chmod") and sys.platform != "win32":
+                try:
+                    os.chmod(tmp_path, 0o600)
+                except Exception:
+                    pass
+
+            os.replace(tmp_path, self.state_file)
+        except Exception as e:
+            print(f"[Vault] Error saving state file: {e}")
+
+    def register_secret(self, secret: str, label: Optional[str] = None, is_dynamic: bool = False) -> str:
         if not secret or len(secret) < 3:
             return secret
 
@@ -204,20 +276,28 @@ class SecretVault:
         self.secret_to_placeholder[secret] = placeholder
         self.placeholder_to_secret[placeholder] = secret
 
+        if is_dynamic:
+            self.dynamic_secrets[placeholder] = {
+                "secret": secret,
+                "ts": time.time(),
+                "label": label or ""
+            }
+
         if self.on_mask:
-            self.on_mask(placeholder, secret)
+            self.on_mask(placeholder, label or "SECRET")
 
         return placeholder
 
     def scan_and_register_dynamic(self, text: str) -> List[Tuple[str, str]]:
         found = []
+        initial_count = len(self.dynamic_secrets)
 
         # 1. Contextual assignments in code or JSON
         for m in self.assignment_pattern.finditer(text):
             var_name = m.group(1)
             val = m.group(2)
             if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
-                ph = self.register_secret(val, var_name)
+                ph = self.register_secret(val, var_name, is_dynamic=True)
                 found.append((val, ph))
 
         # 2. Environment exports
@@ -225,7 +305,7 @@ class SecretVault:
             var_name = m.group(1)
             val = m.group(2)
             if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
-                ph = self.register_secret(val, var_name)
+                ph = self.register_secret(val, var_name, is_dynamic=True)
                 found.append((val, ph))
 
         # 3. Signature patterns
@@ -236,7 +316,7 @@ class SecretVault:
                     match = match[0]
                 if match and len(match) >= 8 and not match.startswith("__VAULT_"):
                     if match not in self.secret_to_placeholder:
-                        ph = self.register_secret(match, label)
+                        ph = self.register_secret(match, label, is_dynamic=True)
                         found.append((match, ph))
 
         # 4. Shannon Entropy analysis for arbitrary high-entropy tokens (>=20 chars)
@@ -246,11 +326,14 @@ class SecretVault:
                 continue
             if any(token.startswith(pfx) for pfx in ("call_", "toolu_", "chatcmpl-", "msg_", "resp_", "ft:", "gpt-", "claude-")):
                 continue
+            # Ignore pure hex strings of length 32, 40, 64 (MD5, Git SHA-1, SHA-256 / Webpack hashes)
+            if re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", token):
+                continue
             if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
                 if not token.startswith("http") and "/" not in token:
                     h = calculate_shannon_entropy(token)
                     if h >= 4.15:
-                        ph = self.register_secret(token, "ENTROPY_KEY")
+                        ph = self.register_secret(token, "ENTROPY_KEY", is_dynamic=True)
                         found.append((token, ph))
 
         # 5. IPv4 Addresses (Local & Public)
@@ -261,12 +344,15 @@ class SecretVault:
             start_pos = m.start()
             if start_pos > 0 and text[start_pos - 1] in ("v", "V", "/"):
                 continue
+            preceding = text[max(0, start_pos - 20):start_pos]
+            if re.search(r"\b(?:version|ver|release|rel)\b", preceding, re.IGNORECASE):
+                continue
 
             clean_ip = ip.split("/")[0]
             if clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", clean_ip):
-                ph = self.register_secret(ip, "LOCAL_IP")
+                ph = self.register_secret(ip, "LOCAL_IP", is_dynamic=True)
             else:
-                ph = self.register_secret(ip, "IP_ADDR")
+                ph = self.register_secret(ip, "IP_ADDR", is_dynamic=True)
             found.append((ip, ph))
 
         # 6. IPv6 Addresses (Validated strictly with ipaddress module)
@@ -280,31 +366,37 @@ class SecretVault:
                     continue
                 if cand in self.secret_to_placeholder or cand.startswith("__VAULT_"):
                     continue
-                ph = self.register_secret(cand, "IPV6_ADDR")
+                ph = self.register_secret(cand, "IPV6_ADDR", is_dynamic=True)
                 found.append((cand, ph))
             except ValueError:
                 continue
 
+        if self.state_file and len(self.dynamic_secrets) > initial_count:
+            self.save_state()
+
         return found
 
     def mask_text(self, text: str) -> Tuple[str, int]:
-        """Replaces all known and newly detected secrets in text with placeholders."""
+        """Replaces all known and newly detected secrets in text with placeholders in a single pass."""
         if not text:
             return text, 0
 
         self.scan_and_register_dynamic(text)
 
-        replacements = 0
-        masked = text
+        if not self.secret_to_placeholder:
+            return text, 0
 
+        replacements = 0
         sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
-        for secret in sorted_secrets:
-            if secret in masked:
-                placeholder = self.secret_to_placeholder[secret]
-                count = masked.count(secret)
-                if count > 0:
-                    masked = masked.replace(secret, placeholder)
-                    replacements += count
+        pattern = re.compile("|".join(re.escape(s) for s in sorted_secrets))
+
+        def _replace_secret(match: re.Match) -> str:
+            nonlocal replacements
+            replacements += 1
+            return self.secret_to_placeholder[match.group(0)]
+
+        masked = pattern.sub(_replace_secret, text)
+        return masked, replacements
 
         return masked, replacements
 
@@ -338,27 +430,26 @@ class SecretVault:
         return data, 0
 
     def demask_text(self, text: str, json_escaped: bool = False) -> Tuple[str, int]:
-        """Restores placeholders in text back to real secrets."""
-        if not text:
+        """Restores placeholders in text back to real secrets in a single pass."""
+        if not text or not self.placeholder_to_secret:
             return text, 0
 
         restorations = 0
-        result = text
         sorted_placeholders = sorted(self.placeholder_to_secret.keys(), key=len, reverse=True)
-        for placeholder in sorted_placeholders:
-            if placeholder in result:
-                real_secret = self.placeholder_to_secret[placeholder]
-                count = result.count(placeholder)
-                if count > 0:
-                    if json_escaped:
-                        replacement = json.dumps(real_secret)[1:-1]
-                    else:
-                        replacement = real_secret
-                    result = result.replace(placeholder, replacement)
-                    restorations += count
-                    if self.on_demask:
-                        self.on_demask(placeholder, real_secret)
+        pattern = re.compile("|".join(re.escape(ph) for ph in sorted_placeholders))
 
+        def _replace_placeholder(match: re.Match) -> str:
+            nonlocal restorations
+            placeholder = match.group(0)
+            real_secret = self.placeholder_to_secret[placeholder]
+            restorations += 1
+            if self.on_demask:
+                self.on_demask(placeholder, real_secret)
+            if json_escaped:
+                return json.dumps(real_secret)[1:-1]
+            return real_secret
+
+        result = pattern.sub(_replace_placeholder, text)
         return result, restorations
 
     def demask_payload(self, data: Any) -> Tuple[Any, int]:
