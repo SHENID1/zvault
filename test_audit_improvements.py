@@ -958,13 +958,21 @@ service_token: MySecretToken99
         self.assertEqual(resp.status_code, 400)
         self.assertIn("Invalid request body", resp.text)
 
-        # 2. Explicitly allowed binary content type (application/octet-stream) is permitted
+        # 2. Explicitly allowed binary content type (e.g. image/png) is permitted without UTF-8 decoding
         resp_bin = client.post(
+            "/agentrouter/v1/chat/completions",
+            content=invalid_bytes,
+            headers={"Content-Type": "image/png", "Host": "localhost:8765"}
+        )
+        self.assertNotEqual(resp_bin.status_code, 400)
+
+        # 3. application/octet-stream with invalid UTF-8 fails closed (400)
+        resp_oct = client.post(
             "/agentrouter/v1/chat/completions",
             content=invalid_bytes,
             headers={"Content-Type": "application/octet-stream", "Host": "localhost:8765"}
         )
-        self.assertNotEqual(resp_bin.status_code, 400)
+        self.assertEqual(resp_oct.status_code, 400)
 
     # --- 42. Dynamic entropy detection catches password_ prefix without false suppression ---
     def test_entropy_password_prefix_detected(self):
@@ -975,6 +983,123 @@ service_token: MySecretToken99
         self.assertNotIn(secret_token, masked)
         self.assertIn("__VAULT_", masked)
         self.assertEqual(count, 1)
+
+    # --- 43. Incremental placeholder prefix indexing performance (<0.25s for 3000 secrets) ---
+    def test_registration_speed_3000_secrets(self):
+        vault = SecretVault()
+        t0 = time.perf_counter()
+        for i in range(3000):
+            vault.register_secret(f"secret_token_val_{i:05d}_key998877")
+        elapsed = time.perf_counter() - t0
+        self.assertLess(elapsed, 0.25, f"Registration of 3000 secrets took {elapsed:.3f}s, expected < 0.25s")
+        self.assertGreater(len(vault.placeholder_prefixes), 3000)
+
+    # --- 44. Data field leak prevention: media validation requires valid base64 media ---
+    def test_data_field_with_mp3_or_image_does_not_leak_api_keys(self):
+        vault = SecretVault()
+        key1 = "sk-ant-api03-secretkey-with-dashes-12345"
+        key2 = "sk-live-stripekey-with-dashes-67890"
+        vault.register_secret(key1)
+        vault.register_secret(key2)
+
+        # Non-base64 key inside tool_use input with format: mp3
+        payload1 = {
+            "type": "tool_use",
+            "name": "audio_generator",
+            "input": {"format": "mp3", "data": key1}
+        }
+        masked1, count1 = vault.mask_payload(payload1)
+        self.assertEqual(count1, 1)
+        self.assertNotIn(key1, masked1["input"]["data"])
+        self.assertIn("__VAULT_", masked1["input"]["data"])
+
+        # Non-base64 key inside node with type: image
+        payload2 = {
+            "type": "image",
+            "data": key2
+        }
+        masked2, count2 = vault.mask_payload(payload2)
+        self.assertEqual(count2, 1)
+        self.assertNotIn(key2, masked2["data"])
+        self.assertIn("__VAULT_", masked2["data"])
+
+        # Real large base64 media payload (>100 chars, valid base64 chars) is preserved untouched
+        real_media = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk" + "A" * 120 + "=="
+        payload3 = {
+            "type": "image",
+            "data": real_media
+        }
+        masked3, count3 = vault.mask_payload(payload3)
+        self.assertEqual(count3, 0)
+        self.assertEqual(masked3["data"], real_media)
+
+    # --- 45. Azure Storage 88-char base64 key and 64-char alnum key detection ---
+    def test_azure_storage_key_and_64_char_alnum_detected(self):
+        import base64
+        import secrets
+        vault = SecretVault()
+
+        # 88-char Azure Storage key
+        azure_key = base64.b64encode(os.urandom(64)).decode("ascii")
+        self.assertEqual(len(azure_key), 88)
+        self.assertTrue(azure_key.endswith("=="))
+
+        # 64-char random alphanumeric token
+        alnum_64 = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(64))
+
+        text = f"Azure conn: AccountKey={azure_key}; and token: {alnum_64}"
+        masked, count = vault.mask_text(text)
+        self.assertNotIn(azure_key, masked)
+        self.assertNotIn(alnum_64, masked)
+        self.assertEqual(count, 2)
+
+    # --- 46. Multi-segment code identifiers with words are not flagged by entropy ---
+    def test_multi_segment_code_identifier_not_flagged_as_secret(self):
+        vault = SecretVault()
+        code_identifier = "test_user_authentication_flow_v2"
+        text = f"Executing test case: {code_identifier}() in test suite"
+        masked, count = vault.mask_text(text)
+        self.assertEqual(count, 0)
+        self.assertEqual(masked, text)
+
+        # Contrast with actual high-entropy segmented key without dictionary words
+        long_segmented_secret = "x8F_9qZ_p2L_7mK_4vB_j3R"
+        masked_long, count_long = vault.mask_text(f"Key is {long_segmented_secret}")
+        self.assertEqual(count_long, 1)
+        self.assertNotIn(long_segmented_secret, masked_long)
+
+    # --- 47. Known secret (e.g. 'abc') does not suppress entropy detection of surrounding tokens ---
+    def test_known_secret_does_not_suppress_entropy_detection(self):
+        vault = SecretVault()
+        vault.register_secret("abc", "SHORT")
+
+        # Candidate token containing "abc" as a substring
+        token = "K9xabcM8pQ2vL4wZ1yT7rE"
+        text = f"Auth token is {token}"
+        masked, count = vault.mask_text(text)
+        self.assertNotIn(token, masked)
+        self.assertIn("__VAULT_", masked)
+        self.assertGreaterEqual(count, 1)
+
+    # --- 48. CLI is_running verifies service field to protect foreign processes ---
+    def test_cli_is_running_verifies_service_name(self):
+        import io
+        from unittest.mock import patch
+        import cli
+
+        # Response from foreign server returning 200 with different service
+        foreign_resp = io.BytesIO(b'{"service": "Random Server", "status": "ok"}')
+        foreign_resp.status = 200
+
+        with patch("urllib.request.urlopen", return_value=foreign_resp):
+            self.assertFalse(cli.is_running())
+
+        # Response from real ZVault
+        zvault_resp = io.BytesIO(b'{"service": "ZCode Secret Masking Proxy", "status": "online"}')
+        zvault_resp.status = 200
+
+        with patch("urllib.request.urlopen", return_value=zvault_resp):
+            self.assertTrue(cli.is_running())
 
 
 if __name__ == "__main__":

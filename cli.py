@@ -74,11 +74,14 @@ def get_auth_headers() -> Dict[str, str]:
 
 
 def is_running() -> bool:
-    """Checks if the proxy server is responding on its port."""
+    """Checks if the proxy server is responding on its port and is verified as ZVault."""
     try:
         req = urllib.request.Request(f"{BASE_URL}/", headers={"User-Agent": "ZVault-CLI"})
         with urllib.request.urlopen(req, timeout=1.0) as resp:
-            return resp.status == 200
+            if resp.status != 200:
+                return False
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("service") == "ZCode Secret Masking Proxy"
     except Exception:
         return False
 
@@ -140,6 +143,7 @@ def cmd_start(args):
                 stdin=subprocess.DEVNULL,
                 creationflags=creationflags
             )
+            log_f.close()
             bg_pid = str(proc.pid)
             with open(PID_FILE, "w") as f:
                 f.write(bg_pid)
@@ -152,6 +156,7 @@ def cmd_start(args):
                 stdin=subprocess.DEVNULL,
                 start_new_session=True
             )
+            log_f.close()
             with open(PID_FILE, "w") as f:
                 f.write(str(proc.pid))
 

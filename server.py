@@ -397,8 +397,8 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
     req_ct = request.headers.get("content-type", "").lower()
     is_multipart = req_ct.startswith("multipart/")
     is_binary = (
-        req_ct.startswith(("image/", "audio/", "video/", "application/octet-stream"))
-        or req_ct in ("application/pdf", "application/zip", "application/gzip")
+        req_ct.startswith(("image/", "audio/", "video/"))
+        or req_ct == "application/pdf"
     )
 
     if raw_body and not is_multipart and not is_binary:

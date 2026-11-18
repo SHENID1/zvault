@@ -89,6 +89,11 @@ THINKING_BLOCK_KEYS = {
 }
 
 
+def _is_valid_media_base64(val: Any) -> bool:
+    """True if val looks like authentic base64 media payload (>=100 chars, standard base64 alphabet)."""
+    return isinstance(val, str) and len(val) >= 100 and bool(re.fullmatch(r"^[A-Za-z0-9+/=\s]+$", val))
+
+
 def _skip_symmetric(node: Dict[str, Any], key: str) -> bool:
     """
     True if `key` of dict `node` must pass through mask/demask untouched.
@@ -120,10 +125,15 @@ def _skip_symmetric(node: Dict[str, Any], key: str) -> bool:
             or str(val.get("media_type", "")).startswith(("image/", "audio/"))
         )
         if is_media_block and val.get("type") == "base64":
+            source_data = val.get("data")
+            if source_data is not None:
+                return _is_valid_media_base64(source_data)
             return True
 
     # 5. Base64 data field: strictly inside an image or audio container node
     if key == "data" and isinstance(val, str):
+        if not _is_valid_media_base64(val):
+            return False
         node_media_type = str(node.get("media_type", "")).lower()
         node_type = str(node.get("type", "")).lower()
         node_format = str(node.get("format", "")).lower()
@@ -184,6 +194,8 @@ class SecretVault:
             (r"\b([rs]k_(?:live|test)_[0-9a-zA-Z]{24,})\b", "STRIPE_KEY"),
             # JSON Web Tokens (JWT)
             (r"\b(eyJ[a-zA-Z0-9_\-]{10,}\.eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,})\b", "JWT_TOKEN"),
+            # Azure Storage Account Key / 64-byte Base64 Secret (88 chars ending in ==)
+            (r"(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{86}==)(?![A-Za-z0-9+/])", "AZURE_KEY"),
             # Database URIs with passwords
             (r"(?:postgres|postgresql|mongodb|mysql|redis):\/\/[^:\/\s]+:([^@\/\s]{4,})@", "DB_PASSWORD"),
         ]
@@ -246,10 +258,9 @@ class SecretVault:
         self.placeholder_prefixes = prefixes
 
     def _invalidate_regex_cache(self):
-        """Invalidates compiled regex caches and rebuilds placeholder prefix set."""
+        """Invalidates compiled regex caches."""
         self._mask_regex = None
         self._demask_regex = None
-        self._rebuild_placeholder_prefixes()
 
     def load_env_file(self, path: str) -> int:
         """Loads secrets from a .env file, ignoring non-sensitive config keys and stripping comments."""
@@ -357,6 +368,7 @@ class SecretVault:
                 del self.dynamic_secrets[ph]
 
             if expired:
+                self._rebuild_placeholder_prefixes()
                 self._invalidate_regex_cache()
                 if self.state_file:
                     self.save_state()
@@ -417,6 +429,7 @@ class SecretVault:
                         self.dynamic_secrets[final_ph] = {"secret": secret, "ts": ts, "label": label}
                         loaded_count += 1
 
+                    self._rebuild_placeholder_prefixes()
                     self._invalidate_regex_cache()
                     if loaded_count > 0:
                         print(f"[Vault] Restored {loaded_count} dynamic secret mapping(s) from state file.")
@@ -480,6 +493,7 @@ class SecretVault:
 
             self.secret_to_placeholder[secret] = placeholder
             self.placeholder_to_secret[placeholder] = secret
+            self._add_placeholder_prefixes(placeholder)
             self._invalidate_regex_cache()
 
         if is_dynamic:
@@ -581,9 +595,9 @@ class SecretVault:
                             found.append((match, ph))
 
             # 4. Shannon Entropy analysis for arbitrary high-entropy tokens (>=20 chars)
-            # Strip data URIs and long base64 blocks so image/audio blobs are not chopped into false-positive secrets
+            # Strip data URIs and long base64 blocks (>=512 chars) so large media blobs are not chopped into false-positive secrets
             text_for_entropy = re.sub(r"data:[a-zA-Z0-9/+.\-]+;base64,[A-Za-z0-9+/=]+", " ", text)
-            text_for_entropy = re.sub(r"[A-Za-z0-9+/]{64,}={0,2}", " ", text_for_entropy)
+            text_for_entropy = re.sub(r"[A-Za-z0-9+/]{512,}={0,2}", " ", text_for_entropy)
 
             potential_tokens = re.findall(r"\b[A-Za-z0-9_\-\.]{20,}\b", text_for_entropy)
             for token in potential_tokens:
@@ -599,11 +613,15 @@ class SecretVault:
                     word_chunks = re.findall(r"[A-Z][a-z]{2,}", token)
                     if len(word_chunks) >= 2 and sum(len(w) for w in word_chunks) / len(token) > 0.60:
                         continue
+                # Ignore code identifiers composed of 3+ segments separated by [_.-] where majority of segments are words of length >= 3
+                if any(sep in token for sep in ("_", "-", ".")):
+                    segments = [s for s in re.split(r"[_\-\.]", token) if s]
+                    if len(segments) >= 3:
+                        word_segments = [s for s in segments if s.isalpha() and len(s) >= 3]
+                        if len(word_segments) / len(segments) >= 0.5:
+                            continue
                 # Ignore file names with common extensions
                 if re.search(r"\.(?:js|ts|py|json|html|css|jsx|tsx|go|rs|cpp|h|java|png|jpg|svg|lock|md)$", token, re.IGNORECASE):
-                    continue
-                # Do not re-register compound tokens that already contain an existing known secret
-                if any(sec in token for sec in self.secret_to_placeholder):
                     continue
                 # Ignore path separators or URLs
                 if "/" in token or "\\" in token or token.startswith("http"):
@@ -660,38 +678,55 @@ class SecretVault:
 
         return found
 
+    def _apply_mask(self, text: str) -> Tuple[str, int]:
+        """Applies compiled mask regex to replace registered secrets in text."""
+        if not text or not self.secret_to_placeholder:
+            return text, 0
+
+        if self._mask_regex is None:
+            sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
+            patterns = []
+            for s in sorted_secrets:
+                esc = re.escape(s)
+                # Word boundaries ONLY for short alphanumeric secrets (< 8 chars) to prevent substring collisions (e.g. abc in abcdef)
+                # Longer secrets (>= 8 chars, like hunter2hunter2) are masked as normal substrings
+                if len(s) < 8 and re.fullmatch(r"^\w+$", s):
+                    patterns.append(rf"\b{esc}\b")
+                else:
+                    patterns.append(esc)
+            self._mask_regex = re.compile("|".join(patterns))
+
+        replacements = 0
+        def _replace_secret(match: re.Match) -> str:
+            nonlocal replacements
+            replacements += 1
+            return self.secret_to_placeholder[match.group(0)]
+
+        masked = self._mask_regex.sub(_replace_secret, text)
+        return masked, replacements
+
     def mask_text(self, text: str) -> Tuple[str, int]:
-        """Replaces all known and newly detected secrets in text with placeholders in a single pass."""
+        """Replaces all known and newly detected secrets in text with placeholders."""
         if not text:
             return text, 0
 
         with self._lock:
-            self.scan_and_register_dynamic(text)
+            total_replacements = 0
 
-            if not self.secret_to_placeholder:
-                return text, 0
+            # 1. First pass: mask known secrets if any exist
+            if self.secret_to_placeholder:
+                text, count = self._apply_mask(text)
+                total_replacements += count
 
-            if self._mask_regex is None:
-                sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
-                patterns = []
-                for s in sorted_secrets:
-                    esc = re.escape(s)
-                    # Word boundaries ONLY for short alphanumeric secrets (< 8 chars) to prevent substring collisions (e.g. abc in abcdef)
-                    # Longer secrets (>= 8 chars, like hunter2hunter2) are masked as normal substrings
-                    if len(s) < 8 and re.fullmatch(r"^\w+$", s):
-                        patterns.append(rf"\b{esc}\b")
-                    else:
-                        patterns.append(esc)
-                self._mask_regex = re.compile("|".join(patterns))
+            # 2. Scan remainder (with known secrets already masked) for dynamic secrets
+            newly_found = self.scan_and_register_dynamic(text)
 
-            replacements = 0
-            def _replace_secret(match: re.Match) -> str:
-                nonlocal replacements
-                replacements += 1
-                return self.secret_to_placeholder[match.group(0)]
+            # 3. Second pass: if new secrets were detected, mask them in the text
+            if newly_found:
+                text, count = self._apply_mask(text)
+                total_replacements += count
 
-            masked = self._mask_regex.sub(_replace_secret, text)
-            return masked, replacements
+            return text, total_replacements
 
     def mask_payload(self, data: Any) -> Tuple[Any, int]:
         """
