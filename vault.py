@@ -95,7 +95,8 @@ SECRET_EXACT_WORDS = {
     "token", "tokens",
     "password", "passwords", "passwd", "passphrase",
     "credential", "credentials",
-    "apikey", "apikeys", "privatekey", "masterkey", "accesstoken"
+    "apikey", "apikeys", "privatekey", "masterkey", "accesstoken",
+    "bearer", "sk", "pk"
 }
 
 

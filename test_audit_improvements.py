@@ -1151,6 +1151,28 @@ service_token: MySecretToken99
         self.assertEqual(d_count, 4)
         self.assertEqual(demasked, text)
 
+    # --- 46d. Short prefixes bearer, sk, and pk are recognized as secret markers ---
+    def test_bearer_and_sk_pk_markers_detected(self):
+        import secrets
+        vault = SecretVault()
+
+        h32 = secrets.token_hex(16)
+        t_bearer = f"bearer_{h32}"
+        t_stripe = f"stripe_sk_{h32}"
+        t_sk = f"sk_{h32}"
+
+        text = f"Auth headers: b={t_bearer}, stripe={t_stripe}, sk={t_sk}"
+        masked, count = vault.mask_text(text)
+
+        self.assertNotIn(t_bearer, masked)
+        self.assertNotIn(t_stripe, masked)
+        self.assertNotIn(t_sk, masked)
+        self.assertEqual(count, 3)
+
+        demasked, d_count = vault.demask_text(masked)
+        self.assertEqual(d_count, 3)
+        self.assertEqual(demasked, text)
+
     # --- 47. Known secret (e.g. 'abc') does not suppress entropy detection of surrounding tokens ---
     def test_known_secret_does_not_suppress_entropy_detection(self):
         vault = SecretVault()
