@@ -41,6 +41,14 @@ DUMMY_VALUES = {
     "sample", "placeholder", "xxx", "xxxx", "null", "none", "undefined"
 }
 
+# Programming language types and keywords to ignore in bare/YAML assignments
+NON_SECRET_TYPES = {
+    "string", "str", "number", "int", "integer", "float", "double", "bool", "boolean",
+    "char", "byte", "bytes", "any", "unknown", "never", "void", "null", "undefined",
+    "true", "false", "object", "array", "list", "dict", "tuple", "set", "map", "record",
+    "optional", "union", "literal", "text", "varchar", "bigint", "date", "datetime", "timestamp"
+}
+
 # Variable name suffixes and prefixes to ignore in contextual assignment scanning
 # Prevents false-positives for parameter names, types, field names, selectors, and URLs
 NON_SECRET_VAR_SUFFIXES = (
@@ -156,8 +164,9 @@ class SecretVault:
         )
 
         # YAML / Config bare assignment on its own line (e.g. DB_PASSWORD: hunter2hunter2)
+        # Excludes code line endings like semicolons, commas, or braces
         self.yaml_assignment_pattern = re.compile(
-            r"""(?im)^\s*["']?([a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"'\s\r\n]{6,})["']?\s*$"""
+            r"""(?im)^\s*["']?([a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"'\s\r\n;,{}]{6,})["']?\s*$"""
         )
 
         # Bearer token pattern (HTTP Authorization headers or curl commands)
@@ -310,20 +319,16 @@ class SecretVault:
                     # Avoid placeholder collision with static secrets
                     final_ph = ph
                     if final_ph in self.placeholder_to_secret and self.placeholder_to_secret[final_ph] != secret:
-                        clean_lbl = label or "SECRET"
-                        final_ph = f"__VAULT_{clean_lbl}_{self.session_nonce}_{self._next_id:02d}__"
-                        self._next_id += 1
+                        clean_lbl = re.sub(r"[^A-Za-z0-9_]", "_", label).upper() if label else "SECRET"
+                        while True:
+                            final_ph = f"__VAULT_{clean_lbl}_{secrets.token_hex(4)}__"
+                            if final_ph not in self.placeholder_to_secret:
+                                break
 
                     self.secret_to_placeholder[secret] = final_ph
                     self.placeholder_to_secret[final_ph] = secret
                     self.dynamic_secrets[final_ph] = {"secret": secret, "ts": ts, "label": label}
                     loaded_count += 1
-
-                    m = re.search(r"_(\d+)__$", final_ph)
-                    if m:
-                        idx = int(m.group(1))
-                        if idx >= self._next_id:
-                            self._next_id = idx + 1
 
                 self._invalidate_regex_cache()
                 if loaded_count > 0:
@@ -368,15 +373,23 @@ class SecretVault:
                 placeholder = f"__{clean_tag}__"
             else:
                 clean_label = re.sub(r"[^A-Za-z0-9_]", "_", label).upper()
-                placeholder = f"__VAULT_{clean_label}_{self.session_nonce}_{self._next_id:02d}__"
+                while True:
+                    placeholder = f"__VAULT_{clean_label}_{secrets.token_hex(4)}__"
+                    if placeholder not in self.placeholder_to_secret:
+                        break
         else:
-            placeholder = f"__VAULT_SECRET_{self.session_nonce}_{self._next_id:02d}__"
+            while True:
+                placeholder = f"__VAULT_SECRET_{secrets.token_hex(4)}__"
+                if placeholder not in self.placeholder_to_secret:
+                    break
 
         if placeholder in self.placeholder_to_secret:
             clean_base = placeholder.strip("_")
-            placeholder = f"__{clean_base}_{self._next_id:02d}__"
+            while True:
+                placeholder = f"__{clean_base}_{secrets.token_hex(4)}__"
+                if placeholder not in self.placeholder_to_secret:
+                    break
 
-        self._next_id += 1
         self.secret_to_placeholder[secret] = placeholder
         self.placeholder_to_secret[placeholder] = secret
         self._invalidate_regex_cache()
@@ -415,14 +428,34 @@ class SecretVault:
         # 1.1 YAML / bare config assignments on individual lines
         for m in self.yaml_assignment_pattern.finditer(text):
             var_name = m.group(1)
-            val = m.group(2)
+            val = m.group(2).strip().rstrip(";,")
             var_lower = var_name.lower()
             if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
                 continue
             if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
                 continue
-            if val and val.strip().lower() in DUMMY_VALUES:
+
+            val_lower = val.lower()
+            if val_lower in DUMMY_VALUES or val_lower in IGNORE_ENV_VALUES or val_lower in NON_SECRET_TYPES:
                 continue
+
+            # Skip type annotations like Optional[str], List[string], Array<string>, etc.
+            if any(val_lower.startswith(t_pfx) for t_pfx in ("optional[", "list[", "dict[", "set[", "tuple[", "array<", "map<", "record<")):
+                continue
+
+            # Skip template expressions and environment substitutions (${VAR}, $VAR, {{VAR}})
+            if "${" in val or "}}" in val or val.startswith("$") or (val.startswith("<") and val.endswith(">")):
+                continue
+
+            # Filter out identifiers/words without digits, without symbols, and without mixed case:
+            # A genuine bare config secret has digits, symbols, or mixed case.
+            # Pure letters in single case (e.g. 'string', 'password', 'custom') are code words/types.
+            has_digits = any(c.isdigit() for c in val)
+            has_symbols = any(c in "-_./@=+!#$%&*?" for c in val)
+            is_mixed_case = any(c.islower() for c in val) and any(c.isupper() for c in val)
+            if not (has_digits or has_symbols or is_mixed_case):
+                continue
+
             if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
                 ph = self.register_secret(val, var_name, is_dynamic=True)
                 found.append((val, ph))
@@ -511,7 +544,12 @@ class SecretVault:
                 continue
             try:
                 ip_obj = ipaddress.IPv6Address(cand)
-                if ip_obj.is_loopback or ip_obj.is_unspecified:
+                # Ignore loopback, unspecified, multicast, and IANA reserved ranges (prevents masking code identifiers like a::b or face::cafe)
+                if ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_multicast or ip_obj.is_reserved:
+                    continue
+                # Reject code identifiers or trivial 2-hextet values without colons/digits (e.g. a::b, face::cafe)
+                parts = [p for p in cand.split(":") if p]
+                if len(parts) < 3 and cand.count(":") < 3:
                     continue
                 if cand in self.secret_to_placeholder or cand.startswith("__VAULT_"):
                     continue
@@ -540,8 +578,9 @@ class SecretVault:
             patterns = []
             for s in sorted_secrets:
                 esc = re.escape(s)
-                # Word boundaries for alphanumeric words to prevent substring collisions
-                if re.fullmatch(r"^\w+$", s):
+                # Word boundaries ONLY for short alphanumeric secrets (< 8 chars) to prevent substring collisions (e.g. abc in abcdef)
+                # Longer secrets (>= 8 chars, like hunter2hunter2) are masked as normal substrings
+                if len(s) < 8 and re.fullmatch(r"^\w+$", s):
                     patterns.append(rf"\b{esc}\b")
                 else:
                     patterns.append(esc)
@@ -560,6 +599,8 @@ class SecretVault:
         """
         Recursively masks string values in a JSON-serializable structure.
         Thinking/reasoning blocks (matched by `type`) are passed through intact; see _skip_symmetric.
+        Keys in JSON_STRING_KEYS (like tool_calls function arguments) are parsed as inner JSON
+        so that escaped characters (\n, \", \\) are matched against secrets without leaking.
         """
         if isinstance(data, str):
             return self.mask_text(data)
@@ -578,6 +619,16 @@ class SecretVault:
                 if k in SYSTEM_SAFE_KEYS or _skip_symmetric(data, k):
                     new_dict[k] = v
                     continue
+
+                if k in JSON_STRING_KEYS and isinstance(v, str):
+                    try:
+                        inner_obj = json.loads(v)
+                        masked_inner, count = self.mask_payload(inner_obj)
+                        new_dict[k] = json.dumps(masked_inner, ensure_ascii=False)
+                        total_replacements += count
+                        continue
+                    except Exception:
+                        pass
 
                 masked_v, count = self.mask_payload(v)
                 new_dict[k] = masked_v
@@ -635,9 +686,19 @@ class SecretVault:
                     continue
 
                 if k in JSON_STRING_KEYS and isinstance(v, str):
-                    demasked_v, count = self.demask_text(v, json_escaped=True)
-                else:
-                    demasked_v, count = self.demask_payload(v)
+                    try:
+                        inner_obj = json.loads(v)
+                        demasked_inner, count = self.demask_payload(inner_obj)
+                        new_dict[k] = json.dumps(demasked_inner, ensure_ascii=False)
+                        total_restorations += count
+                        continue
+                    except Exception:
+                        demasked_v, count = self.demask_text(v, json_escaped=True)
+                        new_dict[k] = demasked_v
+                        total_restorations += count
+                        continue
+
+                demasked_v, count = self.demask_payload(v)
                 new_dict[k] = demasked_v
                 total_restorations += count
             return new_dict, total_restorations
@@ -737,9 +798,10 @@ class SSEStreamDemasker:
 
         while "\n" in self.raw_line_buffer:
             line, self.raw_line_buffer = self.raw_line_buffer.split("\n", 1)
-            line = line.strip()
+            line = line.rstrip("\r")
 
             if not line:
+                output.append("\n")
                 continue
 
             if line.startswith("data:"):
@@ -749,7 +811,7 @@ class SSEStreamDemasker:
                     flushed = self.flush_internal()
                     if flushed:
                         output.append(flushed)
-                    output.append("data: [DONE]\n\n")
+                    output.append("data: [DONE]\n")
                     continue
 
                 try:
@@ -927,7 +989,7 @@ class SSEStreamDemasker:
                     if not modified and isinstance(event_data, (dict, list)):
                         event_data, _ = self.vault.demask_payload(event_data)
 
-                    output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n\n")
+                    output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n")
 
                 except Exception:
                     demasked_line, _ = self.vault.demask_text(line)

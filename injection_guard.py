@@ -36,6 +36,8 @@ class InjectionResult:
     matched_patterns: List[str] = field(default_factory=list)
     has_obfuscation: bool = False
     details: str = ""
+    source: str = "user"
+    should_block: bool = True
 
 
 class PromptInjectionGuard:
@@ -294,33 +296,35 @@ class PromptInjectionGuard:
 
     def scan_payload(self, body_json: Any) -> InjectionResult:
         """
-        Deep-scans an entire LLM request payload:
-        - Chat completions (messages): scans user/tool/developer/system turns, name, tool_calls arguments,
-          and eliminates the spoofed assistant bypass.
-        - Anthropic top-level 'system' prompt
-        - OpenAI / Anthropic 'tools' definitions (including all parameter & property descriptions)
-        - Responses API top-level 'input'
+        Deep-scans an entire LLM request payload, distinguishing source contexts:
+        - user: direct user messages and input (high risk: blocked by default if malicious)
+        - tool_result: outputs from tools read by agent (warning only, prevents agent loop deadlock)
+        - tools: tool definitions & descriptions (warning only)
+        - system: system prompt (warning only)
         """
-        combined_text = []
+        user_bucket = []
+        tool_results_bucket = []
+        tools_def_bucket = []
+        system_bucket = []
 
         if isinstance(body_json, dict):
             # 1. Top-level system prompt (Anthropic)
             sys_prompt = body_json.get("system")
             if isinstance(sys_prompt, str):
-                combined_text.append(sys_prompt)
+                system_bucket.append(sys_prompt)
             elif isinstance(sys_prompt, list):
                 for item in sys_prompt:
                     if isinstance(item, dict) and "text" in item:
-                        combined_text.append(str(item["text"]))
+                        system_bucket.append(str(item["text"]))
 
-            # 2. Tool definitions: scan parameter and property descriptions for tool poisoning attacks
+            # 2. Tool definitions: scan parameter and property descriptions
             tools = body_json.get("tools")
             if isinstance(tools, list):
                 def extract_descriptions(obj: Any):
                     if isinstance(obj, dict):
                         for k, v in obj.items():
                             if k == "description" and isinstance(v, str):
-                                combined_text.append(v)
+                                tools_def_bucket.append(v)
                             else:
                                 extract_descriptions(v)
                     elif isinstance(obj, list):
@@ -337,23 +341,23 @@ class PromptInjectionGuard:
                 for item in untrusted_inputs:
                     if isinstance(item, dict):
                         if "output" in item:
-                            combined_text.append(str(item["output"]))
+                            tool_results_bucket.append(str(item["output"]))
                         if "content" in item:
                             c = item["content"]
                             if isinstance(c, str):
-                                combined_text.append(c)
+                                user_bucket.append(c)
                             elif isinstance(c, list):
                                 for part in c:
                                     if isinstance(part, dict) and "text" in part:
-                                        combined_text.append(str(part["text"]))
+                                        user_bucket.append(str(part["text"]))
                         if "arguments" in item and isinstance(item["arguments"], str):
-                            combined_text.append(item["arguments"])
+                            user_bucket.append(item["arguments"])
                         if "call_id" in item and isinstance(item["call_id"], str):
-                            combined_text.append(item["call_id"])
+                            user_bucket.append(item["call_id"])
                     elif isinstance(item, str):
-                        combined_text.append(item)
+                        user_bucket.append(item)
             elif isinstance(input_data, str):
-                combined_text.append(input_data)
+                user_bucket.append(input_data)
 
             # 4. Messages list (Chat completions)
             messages = body_json.get("messages")
@@ -361,36 +365,43 @@ class PromptInjectionGuard:
                 untrusted_messages = self._extract_untrusted_elements(messages)
                 for msg in untrusted_messages:
                     if isinstance(msg, dict):
+                        role = msg.get("role", "user")
+                        target_bucket = user_bucket
+                        if role in ("tool", "function"):
+                            target_bucket = tool_results_bucket
+                        elif role == "system":
+                            target_bucket = system_bucket
+
                         content = msg.get("content", "")
                         if isinstance(content, str):
-                            combined_text.append(content)
+                            target_bucket.append(content)
                         elif isinstance(content, list):
                             for part in content:
                                 if isinstance(part, str):
-                                    combined_text.append(part)
+                                    target_bucket.append(part)
                                 elif isinstance(part, dict):
-                                    if "text" in part:
-                                        combined_text.append(str(part["text"]))
                                     if part.get("type") == "tool_result":
                                         tr_content = part.get("content", "")
                                         if isinstance(tr_content, str):
-                                            combined_text.append(tr_content)
+                                            tool_results_bucket.append(tr_content)
                                         elif isinstance(tr_content, list):
                                             for sub in tr_content:
                                                 if isinstance(sub, dict) and "text" in sub:
-                                                    combined_text.append(str(sub["text"]))
+                                                    tool_results_bucket.append(str(sub["text"]))
+                                    elif "text" in part:
+                                        target_bucket.append(str(part["text"]))
                                     if "output" in part:
-                                        combined_text.append(str(part["output"]))
+                                        tool_results_bucket.append(str(part["output"]))
 
                         # Scan name and tool_call_id
                         name = msg.get("name")
                         if isinstance(name, str):
-                            combined_text.append(name)
+                            target_bucket.append(name)
                         tcid = msg.get("tool_call_id")
                         if isinstance(tcid, str):
-                            combined_text.append(tcid)
+                            target_bucket.append(tcid)
 
-                        # Scan tool_calls arguments (can be invoked by assistant)
+                        # Scan tool_calls arguments
                         tool_calls = msg.get("tool_calls")
                         if isinstance(tool_calls, list):
                             for tc in tool_calls:
@@ -399,12 +410,12 @@ class PromptInjectionGuard:
                                     if isinstance(func, dict):
                                         args = func.get("arguments")
                                         if isinstance(args, str):
-                                            combined_text.append(args)
+                                            user_bucket.append(args)
                                         fn_name = func.get("name")
                                         if isinstance(fn_name, str):
-                                            combined_text.append(fn_name)
+                                            user_bucket.append(fn_name)
                     elif isinstance(msg, str):
-                        combined_text.append(msg)
+                        user_bucket.append(msg)
 
         elif isinstance(body_json, list):
             for item in body_json:
@@ -412,10 +423,41 @@ class PromptInjectionGuard:
                 if res.is_malicious:
                     return res
         elif isinstance(body_json, str):
-            combined_text.append(body_json)
+            user_bucket.append(body_json)
 
-        full_content = "\n".join(combined_text)
-        return self.scan_text(full_content)
+        # 1. Evaluate User Inputs (Blockable)
+        if user_bucket:
+            res_user = self.scan_text("\n".join(user_bucket))
+            if res_user.is_malicious:
+                res_user.source = "user"
+                res_user.should_block = True
+                return res_user
+
+        # 2. Evaluate Tool Results (Warning only: prevents cycle deadlock if agent reads a file with injection text)
+        if tool_results_bucket:
+            res_tr = self.scan_text("\n".join(tool_results_bucket))
+            if res_tr.is_malicious:
+                res_tr.source = "tool_result"
+                res_tr.should_block = False
+                return res_tr
+
+        # 3. Evaluate Tool Definitions (Warning only: prevents blocking legitimate tools)
+        if tools_def_bucket:
+            res_tools = self.scan_text("\n".join(tools_def_bucket))
+            if res_tools.is_malicious:
+                res_tools.source = "tools"
+                res_tools.should_block = False
+                return res_tools
+
+        # 4. Evaluate System Prompts (Warning only)
+        if system_bucket:
+            res_sys = self.scan_text("\n".join(system_bucket))
+            if res_sys.is_malicious:
+                res_sys.source = "system"
+                res_sys.should_block = False
+                return res_sys
+
+        return InjectionResult(is_malicious=False, risk_score=0.0, source="user", should_block=False)
 
     def scan_messages(self, messages: Any) -> InjectionResult:
         if isinstance(messages, dict):

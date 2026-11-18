@@ -168,15 +168,19 @@ async def security_middleware(request: Request, call_next):
 
     # 2. CSRF & Cross-Origin browser protection (Sec-Fetch-Site and Origin header checks)
     sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
-    if sec_fetch_site == "cross-site":
-        return Response(content="Forbidden: Cross-site request rejected", status_code=403)
+    if sec_fetch_site in ("cross-site", "same-site"):
+        return Response(content="Forbidden: Browser cross-origin request rejected", status_code=403)
 
     origin = request.headers.get("origin")
     if origin:
         parsed_origin = urlparse(origin)
         orig_host = (parsed_origin.hostname or "").lower().strip("[]")
-        if orig_host not in allowed_server_hosts:
-            return Response(content="Forbidden: Cross-origin request blocked", status_code=403)
+        orig_port = parsed_origin.port or (443 if parsed_origin.scheme == "https" else 80)
+        configured_port = int(config.get("port", 8765))
+
+        # Reject any cross-origin request from different ports (e.g. localhost:3000) or untrusted hosts
+        if orig_host not in allowed_server_hosts or orig_port != configured_port:
+            return Response(content="Forbidden: Cross-origin request blocked (origin/port mismatch)", status_code=403)
 
     return await call_next(request)
 
@@ -255,7 +259,94 @@ def resolve_target_url(upstream_name_or_scheme: str, subpath: str) -> str:
     raise HTTPException(status_code=400, detail=f"Unknown upstream or scheme: {upstream_name_or_scheme}")
 
 
+def process_multipart_payload(
+    raw_body: bytes,
+    content_type: str,
+    vault: SecretVault,
+    guard: PromptInjectionGuard,
+    injection_cfg: dict,
+    target_host: str
+) -> bytes:
+    """
+    Parses multipart/form-data payload, scans textual parts/files for prompt injection,
+    and masks secrets with placeholders, preserving binary parts (images/audio) intact.
+    Fails closed if the multipart structure is malformed.
+    """
+    m = re.search(r'boundary=(?:"([^"]+)"|([^;\s]+))', content_type, re.IGNORECASE)
+    if not m:
+        raise HTTPException(status_code=400, detail="Invalid multipart/form-data: missing boundary")
+
+    boundary_str = m.group(1) or m.group(2)
+    boundary_marker = b"--" + boundary_str.encode("latin-1")
+
+    parts = raw_body.split(boundary_marker)
+    if len(parts) < 2:
+        raise HTTPException(status_code=400, detail="Invalid multipart/form-data: malformed parts")
+
+    new_parts = []
+    total_masked = 0
+
+    for idx, part in enumerate(parts):
+        # Preamble or closing delimiter
+        if idx == 0 and part.strip() == b"":
+            new_parts.append(part)
+            continue
+        if part.strip() == b"--" or part.startswith(b"--\r\n") or part.startswith(b"--\n"):
+            new_parts.append(part)
+            continue
+
+        sep = b"\r\n\r\n" if b"\r\n\r\n" in part else (b"\n\n" if b"\n\n" in part else None)
+        if not sep:
+            new_parts.append(part)
+            continue
+
+        header_bytes, body_bytes = part.split(sep, 1)
+
+        # Check for binary data (null bytes in the payload)
+        if b"\x00" in body_bytes[:1024]:
+            new_parts.append(part)
+            continue
+
+        try:
+            body_text = body_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            # Binary part, pass through unmodified
+            new_parts.append(part)
+            continue
+
+        # Scan textual part for prompt injections
+        if injection_cfg.get("enabled", True):
+            inj_res = guard.scan_text(body_text)
+            if inj_res.is_malicious:
+                action = injection_cfg.get("action", "block").lower()
+                if action == "block":
+                    log_warn(f"🛑 BLOCKED PROMPT INJECTION in multipart file/field! Risk: {inj_res.risk_score}")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Request blocked by ZVault Prompt Injection Guard (multipart): {inj_res.category}"
+                    )
+                else:
+                    log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION in multipart! Risk: {inj_res.risk_score}")
+
+        # Mask secrets in textual part
+        masked_text, count = vault.mask_text(body_text)
+        if count > 0:
+            total_masked += count
+            new_parts.append(header_bytes + sep + masked_text.encode("utf-8"))
+        else:
+            new_parts.append(part)
+
+    if total_masked > 0:
+        log_mask(f"Replaced {total_masked} secret(s) in multipart payload before sending to {target_host}")
+
+    return boundary_marker.join(new_parts)
+
+
 async def proxy_request_handler(target_url: str, request: Request) -> Response:
+    # Optional authorization on proxy routes
+    if config.get("require_proxy_token", False):
+        verify_vault_token(request)
+
     # Strip URL fragment if present
     target_url = target_url.split("#")[0]
     safe_target_url = target_url.split("?")[0]
@@ -295,11 +386,11 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                 inj_res = await asyncio.to_thread(injection_guard.scan_payload, body_json)
                 if inj_res.is_malicious:
                     action = injection_cfg.get("action", "block").lower()
-                    if action == "block":
-                        log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
+                    if action == "block" and inj_res.should_block:
+                        log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
                         raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
                     else:
-                        log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns}")
+                        log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
 
             masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
             if count > 0:
@@ -320,6 +411,10 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                     status_code=500,
                     detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
                 )
+    elif raw_body and is_multipart:
+        masked_body = await asyncio.to_thread(
+            process_multipart_payload, raw_body, req_ct, vault, injection_guard, injection_cfg, target_host
+        )
 
     # 2. Prepare headers (strip internal and hop-by-hop headers)
     forward_headers = {}
@@ -408,7 +503,11 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
 
         # Check if content type is textual or JSON
         resp_ct = (upstream_resp.headers.get("content-type") or "").lower()
-        is_textual = any(t in resp_ct for t in ("application/json", "text/", "application/x-ndjson", "application/xml", "application/javascript"))
+        is_textual = (
+            "json" in resp_ct
+            or any(t in resp_ct for t in ("text/", "xml", "javascript", "yaml", "csv"))
+            or (not resp_ct and (resp_bytes.startswith(b"{") or resp_bytes.startswith(b"[") or b"\x00" not in resp_bytes[:1024]))
+        )
 
         if not is_textual:
             # Pass raw binary content (images, audio, downloads) untouched
