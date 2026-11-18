@@ -1151,26 +1151,75 @@ service_token: MySecretToken99
         self.assertEqual(d_count, 4)
         self.assertEqual(demasked, text)
 
-    # --- 46d. Short prefixes bearer, sk, and pk are recognized as secret markers ---
+    # --- 46d. Paired sk/pk, bearer tokens, and structural DB/cache/ID qualifier filtering ---
     def test_bearer_and_sk_pk_markers_detected(self):
         import secrets
         vault = SecretVault()
 
         h32 = secrets.token_hex(16)
+        h24 = secrets.token_hex(12)
+        h40 = secrets.token_hex(20)
+
+        # 1. True secrets: bearer, paired sk/pk with live/test/stripe
         t_bearer = f"bearer_{h32}"
         t_stripe = f"stripe_sk_{h32}"
-        t_sk = f"sk_{h32}"
+        t_sk_live = f"sk_live_{h32}"
+        t_pk_test = f"pk_test_{h32}"
 
-        text = f"Auth headers: b={t_bearer}, stripe={t_stripe}, sk={t_sk}"
+        # 2. Structural DB keys, IDs, and metadata qualifiers that MUST NOT be masked
+        user_pk = f"user_pk_{h24}"
+        order_sk = f"order_sk_{h32}"
+        customer_pk = f"customer_pk_{h40}"
+        item_pk_sk = f"item_pk_sk_{h32}"
+        bare_pk = f"pk_{h24}"
+        bare_sk = f"sk_{h24}"
+        table_sk = f"table_sk_{h32[:16]}"
+        bearer_tok_id = f"bearer_token_id_{h32}"
+        cache_key = f"cache_key_{h32}"
+        primary_key = f"primary_key_{h24}"
+        s3_obj_key = f"s3_object_key_{h32}"
+        sess_tok_id = f"session_token_id_{h32}"
+        token_id = f"token_id_{h24}"
+        secret_id = f"secret_id_{h32}"
+        key_hash = f"key_hash_{h40}"
+        api_key_id = f"api_key_id_{h32}"
+
+        text = (
+            f"Secrets: b={t_bearer}, stripe={t_stripe}, sk={t_sk_live}, pk={t_pk_test}\n"
+            f"Database and metadata IDs: {user_pk}, {order_sk}, {customer_pk}, {item_pk_sk}, "
+            f"{bare_pk}, {bare_sk}, {table_sk}, {bearer_tok_id}, {cache_key}, {primary_key}, "
+            f"{s3_obj_key}, {sess_tok_id}, {token_id}, {secret_id}, {key_hash}, {api_key_id}"
+        )
         masked, count = vault.mask_text(text)
 
+        # True secrets MUST be masked
         self.assertNotIn(t_bearer, masked)
         self.assertNotIn(t_stripe, masked)
-        self.assertNotIn(t_sk, masked)
-        self.assertEqual(count, 3)
+        self.assertNotIn(t_sk_live, masked)
+        self.assertNotIn(t_pk_test, masked)
+
+        # Structural DB keys and ID qualifiers MUST NOT be masked
+        self.assertIn(user_pk, masked)
+        self.assertIn(order_sk, masked)
+        self.assertIn(customer_pk, masked)
+        self.assertIn(item_pk_sk, masked)
+        self.assertIn(bare_pk, masked)
+        self.assertIn(bare_sk, masked)
+        self.assertIn(table_sk, masked)
+        self.assertIn(bearer_tok_id, masked)
+        self.assertIn(cache_key, masked)
+        self.assertIn(primary_key, masked)
+        self.assertIn(s3_obj_key, masked)
+        self.assertIn(sess_tok_id, masked)
+        self.assertIn(token_id, masked)
+        self.assertIn(secret_id, masked)
+        self.assertIn(key_hash, masked)
+        self.assertIn(api_key_id, masked)
+
+        self.assertEqual(count, 4)
 
         demasked, d_count = vault.demask_text(masked)
-        self.assertEqual(d_count, 3)
+        self.assertEqual(d_count, 4)
         self.assertEqual(demasked, text)
 
     # --- 47. Known secret (e.g. 'abc') does not suppress entropy detection of surrounding tokens ---

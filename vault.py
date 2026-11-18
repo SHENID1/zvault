@@ -96,8 +96,44 @@ SECRET_EXACT_WORDS = {
     "password", "passwords", "passwd", "passphrase",
     "credential", "credentials",
     "apikey", "apikeys", "privatekey", "masterkey", "accesstoken",
-    "bearer", "sk", "pk"
+    "bearer"
 }
+
+# Words indicating metadata or descriptors of an identifier (e.g. token_id, key_hash, secret_name)
+ID_QUALIFIER_WORDS = {"id", "ids", "hash", "name", "type", "ref", "index", "count", "version"}
+
+# Common architectural key prefixes that are never sensitive secrets (e.g. cache_key, primary_key)
+NON_SECRET_KEY_PREFIXES = {"cache", "primary", "object", "sort", "partition", "foreign"}
+
+# Pair words required for short prefix markers like sk and pk (to distinguish Stripe keys from DB partition/sort keys)
+SK_PK_PAIR_WORDS = {"live", "test", "prod", "stripe", "secret"}
+
+
+def _has_secret_marker(word_segments: List[str]) -> bool:
+    """True if word segments explicitly indicate a secret credential rather than an ID, hash, or structural key."""
+    if not word_segments:
+        return False
+
+    # 1. If the last word segment before the non-word tail is an ID qualifier, it describes metadata (e.g. token_id, key_hash)
+    if word_segments[-1].lower() in ID_QUALIFIER_WORDS:
+        return False
+
+    # 2. sk / pk require a pair word (live, test, prod, stripe, secret) to distinguish Stripe keys from DB partition/sort keys
+    has_sk_pk = any(w.lower() in ("sk", "pk") for w in word_segments)
+    if has_sk_pk and any(w.lower() in SK_PK_PAIR_WORDS for w in word_segments):
+        return True
+
+    # 3. Check for genuine secret exact words, excluding non-secret structural combinations (cache_key, primary_key, foreign_key...)
+    for i, w in enumerate(word_segments):
+        w_low = w.lower()
+        if w_low in SECRET_EXACT_WORDS:
+            if w_low in ("key", "keys", "token", "tokens") and i > 0:
+                prev_w = word_segments[i - 1].lower()
+                if prev_w in NON_SECRET_KEY_PREFIXES:
+                    continue
+            return True
+
+    return False
 
 
 def _is_valid_media_base64(val: Any) -> bool:
@@ -631,8 +667,8 @@ class SecretVault:
                         word_segments = [s for s in segments if s.isalpha() and (s.islower() or s.isupper()) and 2 <= len(s) < 16]
                         non_word_segments = [s for s in segments if s not in word_segments]
 
-                        # Exact word matches for secret/credential markers (prevents substring collisions like author, keyboard, compass, rapid)
-                        has_secret_marker = any(w.lower() in SECRET_EXACT_WORDS for w in word_segments)
+                        # Check if token explicitly indicates a secret credential rather than an ID, hash, or structural key
+                        has_secret_marker = _has_secret_marker(word_segments)
 
                         # Check if any non-word segment looks like a high-entropy secret (e.g. random key suffix)
                         has_random_segment = False
