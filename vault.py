@@ -90,30 +90,50 @@ THINKING_BLOCK_KEYS = {
 
 
 def _skip_symmetric(node: Dict[str, Any], key: str) -> bool:
-    """True if `key` of dict `node` must pass through mask/demask untouched."""
+    """
+    True if `key` of dict `node` must pass through mask/demask untouched.
+    Only strictly verified binary media structures (images, audio) and thinking blocks are skipped.
+    Arbitrary user data or tool arguments (e.g. tool_use.input.data) are NEVER skipped.
+    """
+    # 1. Thinking / reasoning blocks (symmetric preservation for cryptographic signatures)
     if node.get("type") in THINKING_BLOCK_TYPES and key in THINKING_BLOCK_KEYS:
         return True
-    # Chat Completions assistant message carrying provider reasoning text
     if key == "reasoning_content" and "role" in node:
         return True
-    # Vision & Audio payloads: preserve base64 and data-URIs intact without entropy corruption
+
     val = node.get(key)
-    if isinstance(val, str) and val.startswith("data:"):
+
+    # 2. Skip data: URIs ONLY if they are image, audio, or video media types
+    if isinstance(val, str) and val.startswith(("data:image/", "data:audio/", "data:video/")):
         return True
-    if key == "source" and isinstance(val, dict):
-        if "data" in val or val.get("type") == "base64":
-            return True
-    if key == "data" and isinstance(val, str):
-        if node.get("type") in ("base64", "image", "input_audio") or "media_type" in node or "format" in node:
-            return True
-        if len(val) > 200 and re.match(r"^[A-Za-z0-9+/=\s]+$", val):
-            return True
-    if key == "url" and isinstance(val, str) and val.startswith("data:"):
-        return True
+
+    # 3. Vision image_url structure with data: URI
     if key == "image_url" and isinstance(val, dict):
         u = val.get("url", "")
-        if isinstance(u, str) and u.startswith("data:"):
+        if isinstance(u, str) and u.startswith(("data:image/", "data:audio/", "data:video/")):
             return True
+
+    # 4. Anthropic image source block: strictly requires type: "image" or image/* / audio/* media_type
+    if key == "source" and isinstance(val, dict):
+        is_media_block = (
+            node.get("type") in ("image", "input_audio")
+            or str(val.get("media_type", "")).startswith(("image/", "audio/"))
+        )
+        if is_media_block and val.get("type") == "base64":
+            return True
+
+    # 5. Base64 data field: strictly inside an image or audio container node
+    if key == "data" and isinstance(val, str):
+        node_media_type = str(node.get("media_type", "")).lower()
+        node_type = str(node.get("type", "")).lower()
+        node_format = str(node.get("format", "")).lower()
+        if node_media_type.startswith(("image/", "audio/")) or node_type in ("image", "input_audio"):
+            return True
+        if node_type == "base64" and node_media_type.startswith(("image/", "audio/")):
+            return True
+        if node_format in ("wav", "mp3", "flac", "pcm16", "ogg"):
+            return True
+
     return False
 
 
@@ -130,6 +150,7 @@ class SecretVault:
         self.secret_to_placeholder: Dict[str, str] = {}
         self.placeholder_to_secret: Dict[str, str] = {}
         self.dynamic_secrets: Dict[str, Dict[str, Any]] = {}
+        self.placeholder_prefixes: set = set()
         self._next_id = 1
         self._mask_regex: Optional[re.Pattern] = None
         self._demask_regex: Optional[re.Pattern] = None
@@ -213,10 +234,22 @@ class SecretVault:
         if self.state_file and os.path.exists(self.state_file):
             self.load_state()
 
+    def _add_placeholder_prefixes(self, placeholder: str):
+        for i in range(1, len(placeholder) + 1):
+            self.placeholder_prefixes.add(placeholder[:i])
+
+    def _rebuild_placeholder_prefixes(self):
+        prefixes = set()
+        for ph in self.placeholder_to_secret.keys():
+            for i in range(1, len(ph) + 1):
+                prefixes.add(ph[:i])
+        self.placeholder_prefixes = prefixes
+
     def _invalidate_regex_cache(self):
-        """Invalidates compiled regex caches when secrets or placeholders change."""
+        """Invalidates compiled regex caches and rebuilds placeholder prefix set."""
         self._mask_regex = None
         self._demask_regex = None
+        self._rebuild_placeholder_prefixes()
 
     def load_env_file(self, path: str) -> int:
         """Loads secrets from a .env file, ignoring non-sensitive config keys and stripping comments."""
@@ -569,18 +602,16 @@ class SecretVault:
                 # Ignore file names with common extensions
                 if re.search(r"\.(?:js|ts|py|json|html|css|jsx|tsx|go|rs|cpp|h|java|png|jpg|svg|lock|md)$", token, re.IGNORECASE):
                     continue
-                # Ignore variable names / file stems with words joined by underscore
-                if "_" in token:
-                    subwords = [w.lower() for w in token.split("_") if w]
-                    if any(sw in DUMMY_VALUES or sw in IGNORE_ENV_VALUES or sw in ("password", "passwd", "secret", "token", "key", "backup", "temp", "file") for sw in subwords):
-                        continue
+                # Do not re-register compound tokens that already contain an existing known secret
+                if any(sec in token for sec in self.secret_to_placeholder):
+                    continue
                 # Ignore path separators or URLs
                 if "/" in token or "\\" in token or token.startswith("http"):
                     continue
 
                 if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
                     h = calculate_shannon_entropy(token)
-                    if h >= 3.70:
+                    if h >= 3.85:
                         ph = self.register_secret(token, "ENTROPY_KEY", is_dynamic=True)
                         found.append((token, ph))
 
@@ -785,11 +816,11 @@ class SecretVault:
 class TextStreamDemasker:
     """
     Stateful buffer for continuous text stream (e.g. delta field inside SSE).
-    Buffers ONLY when a genuine unclosed placeholder prefix (e.g. '__VAULT_API' or trailing '_')
+    Buffers ONLY when a genuine prefix of a known active placeholder in this vault session
     is detected at the tail of the stream.
-    Valid unclosed placeholder prefixes must strictly match ^__[A-Za-z0-9_]*$ without spaces.
+    Correctly handles any arbitrary placeholder format (including multiple __ such as __A__B__).
     """
-    def __init__(self, vault: SecretVault, max_placeholder_len: int = 100, json_escaped: bool = False):
+    def __init__(self, vault: SecretVault, max_placeholder_len: int = 120, json_escaped: bool = False):
         self.vault = vault
         self.max_placeholder_len = max_placeholder_len
         self.json_escaped = json_escaped
@@ -804,11 +835,14 @@ class TextStreamDemasker:
         # Demask any complete placeholders currently in buffer
         self.buffer, _ = self.vault.demask_text(self.buffer, json_escaped=self.json_escaped)
 
-        # Look for the last '__' in the buffer
-        last_double_underscore = self.buffer.rfind("__")
+        if not self.buffer:
+            return ""
 
-        if last_double_underscore == -1:
-            # Check if buffer ends with a single '_' (might be start of '__')
+        # Search for the earliest start index in the tail that matches a known placeholder prefix
+        search_start = max(0, len(self.buffer) - self.max_placeholder_len)
+        prefixes = self.vault.placeholder_prefixes
+
+        if not prefixes:
             if self.buffer.endswith("_"):
                 to_emit = self.buffer[:-1]
                 self.buffer = "_"
@@ -817,17 +851,16 @@ class TextStreamDemasker:
             self.buffer = ""
             return to_emit
 
-        tail = self.buffer[last_double_underscore:]
+        earliest_match_idx = None
+        for idx in range(search_start, len(self.buffer)):
+            candidate = self.buffer[idx:]
+            if candidate in prefixes:
+                earliest_match_idx = idx
+                break
 
-        is_candidate_prefix = (
-            re.match(r"^__[A-Za-z0-9_]*$", tail) is not None
-            and tail[2:].find("__") == -1
-            and len(tail) < self.max_placeholder_len
-        )
-
-        if is_candidate_prefix:
-            to_emit = self.buffer[:last_double_underscore]
-            self.buffer = tail
+        if earliest_match_idx is not None:
+            to_emit = self.buffer[:earliest_match_idx]
+            self.buffer = self.buffer[earliest_match_idx:]
             return to_emit
 
         to_emit = self.buffer

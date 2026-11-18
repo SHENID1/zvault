@@ -313,11 +313,11 @@ class PromptInjectionGuard:
 
         return items[last_prior_asst_idx + 1:]
 
-    def scan_payload(self, body_json: Any) -> InjectionResult:
+    def scan_payload(self, body_json: Any, block_tool_results: bool = False) -> InjectionResult:
         """
         Deep-scans an entire LLM request payload, distinguishing source contexts:
-        - user: direct user messages and input (high risk: blocked if malicious)
-        - tool_result: outputs from tools read by agent (indirect prompt injection: blocked if malicious)
+        - user: direct user messages and input (high risk: always blocked if malicious)
+        - tool_result: outputs from tools read by agent (blocked if block_tool_results is True)
         - assistant: model's own prior messages & generated tool calls (warning only, prevents 400 self-lock)
         - tools: tool definitions & descriptions (warning only)
         - system: system prompt (warning only)
@@ -455,7 +455,7 @@ class PromptInjectionGuard:
 
         elif isinstance(body_json, list):
             for item in body_json:
-                res = self.scan_payload(item)
+                res = self.scan_payload(item, block_tool_results=block_tool_results)
                 if res.is_malicious:
                     return res
         elif isinstance(body_json, str):
@@ -469,12 +469,12 @@ class PromptInjectionGuard:
                 res_user.should_block = True
                 return res_user
 
-        # 2. Evaluate Tool Results (Indirect Prompt Injection: blockable in block mode)
+        # 2. Evaluate Tool Results (Indirect Prompt Injection: blockable if block_tool_results=True)
         if tool_results_bucket:
             res_tr = self.scan_text("\n".join(tool_results_bucket))
             if res_tr.is_malicious:
                 res_tr.source = "tool_result"
-                res_tr.should_block = True
+                res_tr.should_block = block_tool_results
                 return res_tr
 
         # 3. Evaluate Assistant Messages & Tool Calls (Warning only: never blocks request)
@@ -503,7 +503,7 @@ class PromptInjectionGuard:
 
         return InjectionResult(is_malicious=False, risk_score=0.0, source="user", should_block=False)
 
-    def scan_messages(self, messages: Any) -> InjectionResult:
+    def scan_messages(self, messages: Any, block_tool_results: bool = False) -> InjectionResult:
         if isinstance(messages, dict):
-            return self.scan_payload(messages)
-        return self.scan_payload({"messages": messages})
+            return self.scan_payload(messages, block_tool_results=block_tool_results)
+        return self.scan_payload({"messages": messages}, block_tool_results=block_tool_results)

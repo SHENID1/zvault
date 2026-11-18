@@ -18,6 +18,7 @@
   "injection_guard": {
     "enabled": true,
     "action": "block",
-    "sensitivity": 0.65
+    "sensitivity": 0.65,
+    "block_tool_results": false
   }
 }

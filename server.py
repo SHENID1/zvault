@@ -398,50 +398,54 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
     is_multipart = req_ct.startswith("multipart/")
     is_binary = (
         req_ct.startswith(("image/", "audio/", "video/", "application/octet-stream"))
-        or "binary" in req_ct
+        or req_ct in ("application/pdf", "application/zip", "application/gzip")
     )
 
     if raw_body and not is_multipart and not is_binary:
-        body_text = None
         try:
             body_text = raw_body.decode("utf-8")
         except UnicodeDecodeError:
-            # Binary body that wasn't declared as such: pass through untouched
-            masked_body = raw_body
+            # FAIL-CLOSED: Non-binary payload failing UTF-8 decoding is rejected (prevents unmasked leaks via UTF-16, Latin-1, etc.)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid request body: expected valid UTF-8 textual payload"
+            )
 
-        if body_text is not None:
+        try:
+            body_json = json.loads(body_text)
+
+            # Deep-scan entire payload for prompt injections & jailbreaks in background worker thread
+            if injection_cfg.get("enabled", True):
+                block_tr = bool(injection_cfg.get("block_tool_results", False))
+                inj_res = await asyncio.to_thread(
+                    injection_guard.scan_payload, body_json, block_tool_results=block_tr
+                )
+                if inj_res.is_malicious:
+                    action = injection_cfg.get("action", "block").lower()
+                    if action == "block" and inj_res.should_block:
+                        log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
+                        raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
+                    else:
+                        log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
+
+            masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
+            if count > 0:
+                log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
+            masked_body = json.dumps(masked_json, ensure_ascii=False).encode("utf-8")
+        except HTTPException:
+            raise
+        except Exception:
             try:
-                body_json = json.loads(body_text)
-
-                # Deep-scan entire payload for prompt injections & jailbreaks in background worker thread
-                if injection_cfg.get("enabled", True):
-                    inj_res = await asyncio.to_thread(injection_guard.scan_payload, body_json)
-                    if inj_res.is_malicious:
-                        action = injection_cfg.get("action", "block").lower()
-                        if action == "block" and inj_res.should_block:
-                            log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
-                            raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
-                        else:
-                            log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
-
-                masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
+                masked_str, count = await asyncio.to_thread(vault.mask_text, body_text)
                 if count > 0:
-                    log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
-                masked_body = json.dumps(masked_json, ensure_ascii=False).encode("utf-8")
-            except HTTPException:
-                raise
-            except Exception:
-                try:
-                    masked_str, count = await asyncio.to_thread(vault.mask_text, body_text)
-                    if count > 0:
-                        log_mask(f"Replaced {count} secret(s) in raw text before sending to {target_host}")
-                    masked_body = masked_str.encode("utf-8")
-                except Exception as ex:
-                    log_warn(f"Masking pipeline failed: {ex}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
-                    )
+                    log_mask(f"Replaced {count} secret(s) in raw text before sending to {target_host}")
+                masked_body = masked_str.encode("utf-8")
+            except Exception as ex:
+                log_warn(f"Masking pipeline failed: {ex}")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
+                )
     elif raw_body and is_multipart:
         masked_body = await asyncio.to_thread(
             process_multipart_payload, raw_body, req_ct, vault, injection_guard, injection_cfg, target_host
