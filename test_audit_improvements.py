@@ -1094,6 +1094,37 @@ service_token: MySecretToken99
         self.assertEqual(d_count, 3)
         self.assertEqual(demasked, text)
 
+    # --- 46c. Hex tail after secret keyword is masked while commit_sha and build_hash are preserved ---
+    def test_multi_segment_secrets_with_hex_tail_and_commit_sha_boundary(self):
+        import secrets
+        vault = SecretVault()
+
+        hex32 = secrets.token_hex(16)  # 32 hex chars
+        hex24 = secrets.token_hex(12)  # 24 hex chars
+        hex40 = secrets.token_hex(20)  # 40 hex chars (Git SHA)
+        hex64 = secrets.token_hex(32)  # 64 hex chars (Docker/SHA-256)
+
+        secret_token_32 = f"prod_api_key_{hex32}"
+        secret_token_24 = f"prod_api_key_{hex24}"
+        git_commit_sha = f"commit_sha_{hex40}"
+        docker_build_hash = f"build_hash_{hex64}"
+
+        text = f"Config: key32={secret_token_32}, key24={secret_token_24}, commit={git_commit_sha}, build={docker_build_hash}"
+        masked, count = vault.mask_text(text)
+
+        # Hex secrets with explicit key/api prefix MUST be masked
+        self.assertNotIn(secret_token_32, masked)
+        self.assertNotIn(secret_token_24, masked)
+        # Git commit and build hash MUST NOT be masked
+        self.assertIn(git_commit_sha, masked)
+        self.assertIn(docker_build_hash, masked)
+        self.assertEqual(count, 2)
+
+        # Demask back to verify round-trip
+        demasked, d_count = vault.demask_text(masked)
+        self.assertEqual(d_count, 2)
+        self.assertEqual(demasked, text)
+
     # --- 47. Known secret (e.g. 'abc') does not suppress entropy detection of surrounding tokens ---
     def test_known_secret_does_not_suppress_entropy_detection(self):
         vault = SecretVault()

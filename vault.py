@@ -620,16 +620,23 @@ class SecretVault:
                         word_segments = [s for s in segments if s.isalpha() and len(s) >= 3]
                         non_word_segments = [s for s in segments if not (s.isalpha() and len(s) >= 3)]
 
+                        # Check if token contains words explicitly indicating a secret/credential
+                        has_secret_marker = any(
+                            any(marker in w.lower() for marker in ("key", "secret", "token", "pass", "auth", "api", "credential"))
+                            for w in word_segments
+                        )
+
                         # Check if any non-word segment looks like a high-entropy secret (e.g. random key suffix)
                         has_random_segment = False
                         for s in non_word_segments:
                             if len(s) >= 16:
-                                # Skip pure hex hashes of standard lengths (Git commit SHA, MD5, SHA-256)
-                                if re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", s):
+                                # Skip pure hex hashes of standard lengths (Git commit SHA, MD5, SHA-256) ONLY if there is no secret keyword
+                                if not has_secret_marker and re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", s):
                                     continue
                                 has_letters_and_digits = any(c.isalpha() for c in s) and any(c.isdigit() for c in s)
                                 has_mixed_case = any(c.islower() for c in s) and any(c.isupper() for c in s)
-                                if (has_letters_and_digits or has_mixed_case) and calculate_shannon_entropy(s) >= 3.5:
+                                min_entropy = 2.85 if has_secret_marker else 3.5
+                                if (has_letters_and_digits or has_mixed_case) and calculate_shannon_entropy(s) >= min_entropy:
                                     has_random_segment = True
                                     break
 
