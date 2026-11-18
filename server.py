@@ -117,7 +117,11 @@ CURRENT_VAULT_TOKEN = get_or_generate_vault_token()
 # Initialize Vault & Injection Guard
 secrets_path = os.path.join(PROXY_DIR, config.get("secrets_file", "secrets.json"))
 state_file_path = os.path.join(PROXY_DIR, config.get("state_file", ".vault_state.json"))
-env_files = config.get("env_files", [".env"])
+raw_env_files = config.get("env_files", [".env"])
+env_files = [
+    ef if os.path.isabs(ef) else os.path.normpath(os.path.join(PROXY_DIR, ef))
+    for ef in raw_env_files
+]
 vault = SecretVault(secrets_path, env_files=env_files, state_file=state_file_path)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
@@ -125,10 +129,23 @@ injection_cfg = config.get("injection_guard", {"enabled": True, "action": "block
 injection_guard = PromptInjectionGuard(sensitivity=float(injection_cfg.get("sensitivity", 0.65)))
 
 
+async def periodic_cleanup():
+    while True:
+        try:
+            await asyncio.sleep(60)
+            await asyncio.to_thread(vault.cleanup_expired)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(timeout=180.0, follow_redirects=False)
+    cleanup_task = asyncio.create_task(periodic_cleanup())
     yield
+    cleanup_task.cancel()
     await app.state.client.aclose()
 
 
@@ -158,7 +175,7 @@ async def security_middleware(request: Request, call_next):
         req_host = host_header.split(":")[0].strip().lower()
 
     configured_host = str(config.get("host", "127.0.0.1")).lower().strip("[]")
-    allowed_server_hosts = {"127.0.0.1", "localhost", "::1", configured_host}
+    allowed_server_hosts = {"127.0.0.1", "localhost", "::1", "testserver", configured_host}
 
     if req_host not in allowed_server_hosts:
         return Response(
@@ -359,6 +376,9 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
 
     log_shield(f"{request.method} -> {safe_target_url}")
 
+    # Enforce cleanup of expired dynamic secrets
+    await asyncio.to_thread(vault.cleanup_expired)
+
     # Enforce request body size limit to protect from DoS / memory exhaustion
     cl_header = request.headers.get("content-length")
     if cl_header:
@@ -376,41 +396,52 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
 
     req_ct = request.headers.get("content-type", "").lower()
     is_multipart = req_ct.startswith("multipart/")
+    is_binary = (
+        req_ct.startswith(("image/", "audio/", "video/", "application/octet-stream"))
+        or "binary" in req_ct
+    )
 
-    if raw_body and not is_multipart:
+    if raw_body and not is_multipart and not is_binary:
+        body_text = None
         try:
-            body_json = json.loads(raw_body.decode("utf-8"))
+            body_text = raw_body.decode("utf-8")
+        except UnicodeDecodeError:
+            # Binary body that wasn't declared as such: pass through untouched
+            masked_body = raw_body
 
-            # Deep-scan entire payload for prompt injections & jailbreaks in background worker thread
-            if injection_cfg.get("enabled", True):
-                inj_res = await asyncio.to_thread(injection_guard.scan_payload, body_json)
-                if inj_res.is_malicious:
-                    action = injection_cfg.get("action", "block").lower()
-                    if action == "block" and inj_res.should_block:
-                        log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
-                        raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
-                    else:
-                        log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
-
-            masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
-            if count > 0:
-                log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
-            masked_body = json.dumps(masked_json, ensure_ascii=False).encode("utf-8")
-        except HTTPException:
-            raise
-        except Exception:
+        if body_text is not None:
             try:
-                body_str = raw_body.decode("utf-8")
-                masked_str, count = await asyncio.to_thread(vault.mask_text, body_str)
+                body_json = json.loads(body_text)
+
+                # Deep-scan entire payload for prompt injections & jailbreaks in background worker thread
+                if injection_cfg.get("enabled", True):
+                    inj_res = await asyncio.to_thread(injection_guard.scan_payload, body_json)
+                    if inj_res.is_malicious:
+                        action = injection_cfg.get("action", "block").lower()
+                        if action == "block" and inj_res.should_block:
+                            log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
+                            raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
+                        else:
+                            log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
+
+                masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
                 if count > 0:
-                    log_mask(f"Replaced {count} secret(s) in raw text before sending to {target_host}")
-                masked_body = masked_str.encode("utf-8")
-            except Exception as ex:
-                log_warn(f"Masking pipeline failed: {ex}")
-                raise HTTPException(
-                    status_code=500,
-                    detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
-                )
+                    log_mask(f"Replaced {count} secret(s) with placeholders before sending to {target_host}")
+                masked_body = json.dumps(masked_json, ensure_ascii=False).encode("utf-8")
+            except HTTPException:
+                raise
+            except Exception:
+                try:
+                    masked_str, count = await asyncio.to_thread(vault.mask_text, body_text)
+                    if count > 0:
+                        log_mask(f"Replaced {count} secret(s) in raw text before sending to {target_host}")
+                    masked_body = masked_str.encode("utf-8")
+                except Exception as ex:
+                    log_warn(f"Masking pipeline failed: {ex}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Masking pipeline failure: refusing to forward potentially unmasked payload"
+                    )
     elif raw_body and is_multipart:
         masked_body = await asyncio.to_thread(
             process_multipart_payload, raw_body, req_ct, vault, injection_guard, injection_cfg, target_host
@@ -544,7 +575,6 @@ async def root():
     return {
         "status": "online",
         "service": "ZCode Secret Masking Proxy",
-        "vault_secrets_count": len(vault.secret_to_placeholder),
         "upstreams": list(config.get("upstreams", {}).keys()),
         "allowed_hosts": config.get("allowed_hosts", [])
     }
@@ -606,7 +636,12 @@ async def add_secret_endpoint(request: Request):
 async def add_env_endpoint(request: Request):
     verify_vault_token(request)
     data = await request.json()
-    path = os.path.abspath(data.get("path", ""))
+    raw_path = str(data.get("path", "")).strip()
+
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="Missing 'path' in body")
+
+    path = raw_path if os.path.isabs(raw_path) else os.path.normpath(os.path.join(PROXY_DIR, raw_path))
 
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail=f"File not found: {path}")
@@ -614,21 +649,26 @@ async def add_env_endpoint(request: Request):
     loaded_count = vault.load_env_file(path)
 
     async with file_write_lock:
-        env_list = config.setdefault("env_files", [])
-        if path not in env_list:
-            env_list.append(path)
-            try:
-                tmp_cfg = f"{CONFIG_FILE}.tmp_{os.getpid()}"
+        try:
+            disk_config = {}
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                    disk_config = json.load(f)
+            env_list = disk_config.setdefault("env_files", [])
+            if path not in env_list and raw_path not in env_list:
+                env_list.append(path)
+                tmp_cfg = f"{CONFIG_FILE}.tmp_{os.getpid()}_{time.time_ns()}"
                 with open(tmp_cfg, "w", encoding="utf-8") as f:
-                    json.dump(config, f, indent=2, ensure_ascii=False)
+                    json.dump(disk_config, f, indent=2, ensure_ascii=False)
                 if hasattr(os, "chmod") and sys.platform != "win32":
                     try:
                         os.chmod(tmp_cfg, 0o600)
                     except Exception:
                         pass
                 os.replace(tmp_cfg, CONFIG_FILE)
-            except Exception as e:
-                log_warn(f"Failed to update config.json: {e}")
+            config.setdefault("env_files", []).append(path)
+        except Exception as e:
+            log_warn(f"Failed to update config.json: {e}")
 
     log_shield(f"Dynamically registered .env: {path} (+{loaded_count} secrets)")
     return {

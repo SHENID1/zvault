@@ -34,11 +34,12 @@ IGNORE_ENV_VALUES = {
     "debug", "info", "warn", "error", "trace", "fatal", "yes", "no", "on", "off"
 }
 
-# Dummy placeholder secrets and non-secrets commonly found in source code / docs
+# Dummy placeholder secrets and non-secrets commonly found in source code / docs / databases
 DUMMY_VALUES = {
     "changeme", "dummy", "example", "your_api_key_here", "your_key", "your_secret",
     "todo", "secret", "password", "tokenizer", "gpt2-tokenizer", "test", "demo",
-    "sample", "placeholder", "xxx", "xxxx", "null", "none", "undefined"
+    "sample", "placeholder", "xxx", "xxxx", "null", "none", "undefined",
+    "admin", "root", "user", "guest", "postgres", "mysql", "redis", "mongodb", "localhost"
 }
 
 # Programming language types and keywords to ignore in bare/YAML assignments
@@ -54,8 +55,10 @@ NON_SECRET_TYPES = {
 NON_SECRET_VAR_SUFFIXES = (
     "name", "type", "field", "url", "path", "header",
     "class", "selector", "tag", "param", "schema",
+    "user", "username", "email", "host", "port", "database", "db", "service",
     "_name", "_type", "_field", "_url", "_path", "_header",
-    "_class", "_selector", "_tag", "_param", "_schema", "_key_name"
+    "_class", "_selector", "_tag", "_param", "_schema", "_key_name",
+    "_user", "_username", "_email", "_host", "_port", "_database", "_db", "_service"
 )
 NON_SECRET_VAR_PREFIXES = (
     "public_", "next_public_", "default_type"
@@ -93,6 +96,24 @@ def _skip_symmetric(node: Dict[str, Any], key: str) -> bool:
     # Chat Completions assistant message carrying provider reasoning text
     if key == "reasoning_content" and "role" in node:
         return True
+    # Vision & Audio payloads: preserve base64 and data-URIs intact without entropy corruption
+    val = node.get(key)
+    if isinstance(val, str) and val.startswith("data:"):
+        return True
+    if key == "source" and isinstance(val, dict):
+        if "data" in val or val.get("type") == "base64":
+            return True
+    if key == "data" and isinstance(val, str):
+        if node.get("type") in ("base64", "image", "input_audio") or "media_type" in node or "format" in node:
+            return True
+        if len(val) > 200 and re.match(r"^[A-Za-z0-9+/=\s]+$", val):
+            return True
+    if key == "url" and isinstance(val, str) and val.startswith("data:"):
+        return True
+    if key == "image_url" and isinstance(val, dict):
+        u = val.get("url", "")
+        if isinstance(u, str) and u.startswith("data:"):
+            return True
     return False
 
 
@@ -104,6 +125,7 @@ class SecretVault:
         self.state_file = state_file
         self.state_ttl = state_ttl
         self.session_nonce = session_nonce or secrets.token_hex(3)
+        self._lock = threading.RLock()
         self._state_lock = threading.Lock()
         self.secret_to_placeholder: Dict[str, str] = {}
         self.placeholder_to_secret: Dict[str, str] = {}
@@ -159,14 +181,15 @@ class SecretVault:
         )
 
         # Contextual assignment patterns (code with quoted values or JSON with quoted keys & values)
+        # Bounded identifier length {0,40} prevents quadratic backtracking (ReDoS) on large minified code/hex dumps
         self.assignment_pattern = re.compile(
-            r"""(?i)["']?([a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd|private[_-]?key)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']([^"']{6,})["']"""
+            r"""(?i)(?:["']\b|\b)([a-zA-Z0-9_]{0,40}(?:api[_-]?key|secret|token|password|passwd|private[_-]?key)[a-zA-Z0-9_]{0,40})(?:\b["']|\b)\s*[:=]\s*["']([^"'\r\n]{6,})["']"""
         )
 
         # YAML / Config bare assignment on its own line (e.g. DB_PASSWORD: hunter2hunter2)
         # Excludes code line endings like semicolons, commas, or braces
         self.yaml_assignment_pattern = re.compile(
-            r"""(?im)^\s*["']?([a-zA-Z0-9_]*(?:api[_-]?key|secret|token|password|passwd)[a-zA-Z0-9_]*)["']?\s*[:=]\s*["']?([^"'\s\r\n;,{}]{6,})["']?\s*$"""
+            r"""(?im)^\s*["']?([a-zA-Z0-9_]{0,40}(?:api[_-]?key|secret|token|password|passwd)[a-zA-Z0-9_]{0,40})["']?\s*[:=]\s*["']?([^"'\s\r\n;,{}]{6,})["']?\s*$"""
         )
 
         # Bearer token pattern (HTTP Authorization headers or curl commands)
@@ -196,30 +219,58 @@ class SecretVault:
         self._demask_regex = None
 
     def load_env_file(self, path: str) -> int:
-        """Loads secrets from a .env file, ignoring non-sensitive config keys."""
+        """Loads secrets from a .env file, ignoring non-sensitive config keys and stripping comments."""
         loaded = 0
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if "=" in line:
-                        key, val = line.split("=", 1)
-                        key = key.strip()
-                        val = val.strip().strip("\"'").strip()
+            items = {}
+            try:
+                from dotenv import dotenv_values
+                parsed = dotenv_values(path)
+                if parsed:
+                    items = {k: v for k, v in parsed.items() if k and v}
+            except Exception:
+                items = {}
 
-                        if key.upper() in IGNORE_ENV_KEYS:
+            if not items and os.path.exists(path):
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
                             continue
-                        if val.lower() in IGNORE_ENV_VALUES:
-                            continue
-                        if val.lower() in DUMMY_VALUES:
-                            continue
-                        if val.isdigit() and len(val) < 8:
-                            continue
-                        if len(val) >= 5:
-                            self.register_secret(val, key)
-                            loaded += 1
+                        if "=" in line:
+                            key, val = line.split("=", 1)
+                            key = key.strip()
+                            val = val.strip()
+                            # Handle quotes and strip inline comments
+                            if (val.startswith('"') and '"' in val[1:]) or (val.startswith("'") and "'" in val[1:]):
+                                quote_char = val[0]
+                                end_idx = val.find(quote_char, 1)
+                                val = val[1:end_idx]
+                            else:
+                                if "#" in val:
+                                    val = val.split("#", 1)[0].strip()
+                                val = val.strip("\"'").strip()
+                            items[key] = val
+
+            for key, val in items.items():
+                if not key or not val:
+                    continue
+                key_lower = key.lower()
+                if key.upper() in IGNORE_ENV_KEYS:
+                    continue
+                if any(key_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
+                    continue
+                if any(key_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
+                    continue
+
+                val_clean = val.strip().lower()
+                if val_clean in IGNORE_ENV_VALUES or val_clean in DUMMY_VALUES or val_clean in NON_SECRET_TYPES:
+                    continue
+                if val.isdigit() and len(val) < 8:
+                    continue
+                if len(val) >= 5:
+                    self.register_secret(val, key)
+                    loaded += 1
             print(f"[Vault] Loaded {loaded} secret(s) from .env file: {path}")
         except Exception as e:
             print(f"[Vault] Error loading .env from {path}: {e}")
@@ -261,80 +312,83 @@ class SecretVault:
         if self.state_ttl <= 0 or not self.dynamic_secrets:
             return 0
         now = time.time()
-        expired = [
-            ph for ph, info in self.dynamic_secrets.items()
-            if (now - float(info.get("ts", 0))) > self.state_ttl
-        ]
-        for ph in expired:
-            secret = self.placeholder_to_secret.pop(ph, None)
-            if secret and secret in self.secret_to_placeholder:
-                del self.secret_to_placeholder[secret]
-            del self.dynamic_secrets[ph]
+        with self._lock:
+            expired = [
+                ph for ph, info in self.dynamic_secrets.items()
+                if (now - float(info.get("ts", 0))) > self.state_ttl
+            ]
+            for ph in expired:
+                secret = self.placeholder_to_secret.pop(ph, None)
+                if secret and secret in self.secret_to_placeholder:
+                    del self.secret_to_placeholder[secret]
+                del self.dynamic_secrets[ph]
 
-        if expired:
-            self._invalidate_regex_cache()
-            if self.state_file:
-                self.save_state()
-        return len(expired)
+            if expired:
+                self._invalidate_regex_cache()
+                if self.state_file:
+                    self.save_state()
+            return len(expired)
 
     def load_state(self):
         """Loads dynamically registered secrets from state_file, discarding expired entries and preventing collisions."""
         if not self.state_file or not os.path.exists(self.state_file):
             return
-        try:
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if not content:
-                    return
-                data = json.loads(content)
-                now = time.time()
-                loaded_count = 0
+        with self._lock:
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                    if not content:
+                        return
+                    data = json.loads(content)
+                    now = time.time()
+                    loaded_count = 0
 
-                if isinstance(data, dict) and "secrets" in data:
-                    self.session_nonce = data.get("session_nonce", self.session_nonce)
-                    items_dict = data.get("secrets", {})
-                else:
-                    items_dict = data
-
-                for ph, info in items_dict.items():
-                    if isinstance(info, dict):
-                        secret = info.get("secret")
-                        ts = float(info.get("ts", 0))
-                        label = info.get("label")
+                    if isinstance(data, dict) and "secrets" in data:
+                        items_dict = data.get("secrets", {})
                     else:
-                        secret = str(info)
-                        ts = now
-                        label = None
+                        items_dict = data
 
-                    if not secret:
-                        continue
+                    for ph, info in items_dict.items():
+                        if isinstance(info, dict):
+                            secret = info.get("secret")
+                            ts = float(info.get("ts", 0))
+                            label = info.get("label")
+                        else:
+                            secret = str(info)
+                            ts = now
+                            label = None
 
-                    if self.state_ttl > 0 and (now - ts) > self.state_ttl:
-                        continue
+                        if not secret:
+                            continue
 
-                    # Static secrets already loaded take absolute precedence
-                    if secret in self.secret_to_placeholder:
-                        continue
+                        if self.state_ttl > 0 and (now - ts) > self.state_ttl:
+                            continue
 
-                    # Avoid placeholder collision with static secrets
-                    final_ph = ph
-                    if final_ph in self.placeholder_to_secret and self.placeholder_to_secret[final_ph] != secret:
-                        clean_lbl = re.sub(r"[^A-Za-z0-9_]", "_", label).upper() if label else "SECRET"
-                        while True:
-                            final_ph = f"__VAULT_{clean_lbl}_{secrets.token_hex(4)}__"
-                            if final_ph not in self.placeholder_to_secret:
-                                break
+                        # Static secrets already loaded take absolute precedence
+                        if secret in self.secret_to_placeholder:
+                            continue
 
-                    self.secret_to_placeholder[secret] = final_ph
-                    self.placeholder_to_secret[final_ph] = secret
-                    self.dynamic_secrets[final_ph] = {"secret": secret, "ts": ts, "label": label}
-                    loaded_count += 1
+                        # Avoid placeholder collision with static secrets and normalize any inner double underscores
+                        clean_base = re.sub(r"_+", "_", ph.strip("_"))
+                        final_ph = f"__{clean_base}__"
+                        if final_ph in self.placeholder_to_secret and self.placeholder_to_secret[final_ph] != secret:
+                            clean_lbl = re.sub(r"[^A-Za-z0-9_]", "_", label).upper() if label else "SECRET"
+                            clean_lbl = re.sub(r"_+", "_", clean_lbl).strip("_")
+                            while True:
+                                final_ph = f"__VAULT_{clean_lbl}_{secrets.token_hex(4)}__"
+                                if final_ph not in self.placeholder_to_secret:
+                                    break
 
-                self._invalidate_regex_cache()
-                if loaded_count > 0:
-                    print(f"[Vault] Restored {loaded_count} dynamic secret mapping(s) from state file.")
-        except Exception as e:
-            print(f"[Vault] Error loading state file: {e}")
+                        self.secret_to_placeholder[secret] = final_ph
+                        self.placeholder_to_secret[final_ph] = secret
+                        self.dynamic_secrets[final_ph] = {"secret": secret, "ts": ts, "label": label}
+                        loaded_count += 1
+
+                    self._invalidate_regex_cache()
+                    if loaded_count > 0:
+                        print(f"[Vault] Restored {loaded_count} dynamic secret mapping(s) from state file.")
+            except Exception as e:
+                print(f"[Vault] Error loading state file: {e}")
 
     def save_state(self):
         """Persists dynamic secret mappings to state_file atomically with 0o600 permissions."""
@@ -344,7 +398,6 @@ class SecretVault:
             try:
                 tmp_path = f"{self.state_file}.tmp_{os.getpid()}_{time.time_ns()}"
                 payload = {
-                    "session_nonce": self.session_nonce,
                     "secrets": self.dynamic_secrets
                 }
                 with open(tmp_path, "w", encoding="utf-8") as f:
@@ -364,35 +417,37 @@ class SecretVault:
         if not secret or len(secret) < 3:
             return secret
 
-        if secret in self.secret_to_placeholder:
-            return self.secret_to_placeholder[secret]
+        with self._lock:
+            if secret in self.secret_to_placeholder:
+                return self.secret_to_placeholder[secret]
 
-        if label:
-            if label.startswith("__") and label.endswith("__") and len(label) > 4:
-                clean_tag = re.sub(r"[^A-Za-z0-9_]", "_", label[2:-2])
-                placeholder = f"__{clean_tag}__"
+            if label:
+                if label.startswith("__") and label.endswith("__") and len(label) > 4:
+                    clean_tag = re.sub(r"_+", "_", re.sub(r"[^A-Za-z0-9_]", "_", label[2:-2])).strip("_")
+                    placeholder = f"__{clean_tag}__"
+                else:
+                    clean_label = re.sub(r"[^A-Za-z0-9_]", "_", label).upper()
+                    clean_label = re.sub(r"_+", "_", clean_label).strip("_")
+                    while True:
+                        placeholder = f"__VAULT_{clean_label}_{secrets.token_hex(4)}__"
+                        if placeholder not in self.placeholder_to_secret:
+                            break
             else:
-                clean_label = re.sub(r"[^A-Za-z0-9_]", "_", label).upper()
                 while True:
-                    placeholder = f"__VAULT_{clean_label}_{secrets.token_hex(4)}__"
+                    placeholder = f"__VAULT_SECRET_{secrets.token_hex(4)}__"
                     if placeholder not in self.placeholder_to_secret:
                         break
-        else:
-            while True:
-                placeholder = f"__VAULT_SECRET_{secrets.token_hex(4)}__"
-                if placeholder not in self.placeholder_to_secret:
-                    break
 
-        if placeholder in self.placeholder_to_secret:
-            clean_base = placeholder.strip("_")
-            while True:
-                placeholder = f"__{clean_base}_{secrets.token_hex(4)}__"
-                if placeholder not in self.placeholder_to_secret:
-                    break
+            if placeholder in self.placeholder_to_secret:
+                clean_base = re.sub(r"_+", "_", placeholder.strip("_"))
+                while True:
+                    placeholder = f"__{clean_base}_{secrets.token_hex(4)}__"
+                    if placeholder not in self.placeholder_to_secret:
+                        break
 
-        self.secret_to_placeholder[secret] = placeholder
-        self.placeholder_to_secret[placeholder] = secret
-        self._invalidate_regex_cache()
+            self.secret_to_placeholder[secret] = placeholder
+            self.placeholder_to_secret[placeholder] = secret
+            self._invalidate_regex_cache()
 
         if is_dynamic:
             self.dynamic_secrets[placeholder] = {
@@ -408,158 +463,169 @@ class SecretVault:
 
     def scan_and_register_dynamic(self, text: str) -> List[Tuple[str, str]]:
         found = []
-        initial_count = len(self.dynamic_secrets)
+        with self._lock:
+            initial_count = len(self.dynamic_secrets)
 
-        # 1. Contextual assignments in code and JSON with quoted keys & values
-        for m in self.assignment_pattern.finditer(text):
-            var_name = m.group(1)
-            val = m.group(2)
-            var_lower = var_name.lower()
-            if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
-                continue
-            if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
-                continue
-            if val and val.strip().lower() in DUMMY_VALUES:
-                continue
-            if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
-                ph = self.register_secret(val, var_name, is_dynamic=True)
-                found.append((val, ph))
-
-        # 1.1 YAML / bare config assignments on individual lines
-        for m in self.yaml_assignment_pattern.finditer(text):
-            var_name = m.group(1)
-            val = m.group(2).strip().rstrip(";,")
-            var_lower = var_name.lower()
-            if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
-                continue
-            if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
-                continue
-
-            val_lower = val.lower()
-            if val_lower in DUMMY_VALUES or val_lower in IGNORE_ENV_VALUES or val_lower in NON_SECRET_TYPES:
-                continue
-
-            # Skip type annotations like Optional[str], List[string], Array<string>, etc.
-            if any(val_lower.startswith(t_pfx) for t_pfx in ("optional[", "list[", "dict[", "set[", "tuple[", "array<", "map<", "record<")):
-                continue
-
-            # Skip template expressions and environment substitutions (${VAR}, $VAR, {{VAR}})
-            if "${" in val or "}}" in val or val.startswith("$") or (val.startswith("<") and val.endswith(">")):
-                continue
-
-            # Filter out identifiers/words without digits, without symbols, and without mixed case:
-            # A genuine bare config secret has digits, symbols, or mixed case.
-            # Pure letters in single case (e.g. 'string', 'password', 'custom') are code words/types.
-            has_digits = any(c.isdigit() for c in val)
-            has_symbols = any(c in "-_./@=+!#$%&*?" for c in val)
-            is_mixed_case = any(c.islower() for c in val) and any(c.isupper() for c in val)
-            if not (has_digits or has_symbols or is_mixed_case):
-                continue
-
-            if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
-                ph = self.register_secret(val, var_name, is_dynamic=True)
-                found.append((val, ph))
-
-        # 1.1 Bearer tokens in Authorization headers / curl
-        for m in self.bearer_pattern.finditer(text):
-            tok = m.group(1).strip()
-            if tok and tok.lower() not in DUMMY_VALUES and tok not in self.secret_to_placeholder and not tok.startswith("__VAULT_"):
-                ph = self.register_secret(tok, "BEARER_TOKEN", is_dynamic=True)
-                found.append((tok, ph))
-
-        # 2. Environment exports
-        for m in self.env_pattern.finditer(text):
-            var_name = m.group(1)
-            val = m.group(2)
-            var_lower = var_name.lower()
-            if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
-                continue
-            if val and (val.strip().lower() in DUMMY_VALUES or val.strip().lower() in IGNORE_ENV_VALUES):
-                continue
-            if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
-                ph = self.register_secret(val, var_name, is_dynamic=True)
-                found.append((val, ph))
-
-        # 3. Signature patterns
-        for pattern, label in self.signature_patterns:
-            matches = re.findall(pattern, text)
-            for match in matches:
-                if isinstance(match, tuple):
-                    match = match[0]
-                if match and len(match) >= 8 and not match.startswith("__VAULT_"):
-                    if match not in self.secret_to_placeholder:
-                        ph = self.register_secret(match, label, is_dynamic=True)
-                        found.append((match, ph))
-
-        # 4. Shannon Entropy analysis for arbitrary high-entropy tokens (>=20 chars)
-        potential_tokens = re.findall(r"\b[A-Za-z0-9_\-\.]{20,}\b", text)
-        for token in potential_tokens:
-            if token in self.secret_to_placeholder or token.startswith("__VAULT_"):
-                continue
-            if any(token.startswith(pfx) for pfx in ("call_", "toolu_", "chatcmpl-", "msg_", "resp_", "ft:", "gpt-", "claude-")):
-                continue
-            # Ignore pure hex strings of length 32, 40, 64 (MD5, Git SHA-1, SHA-256 / Webpack hashes)
-            if re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", token):
-                continue
-            # Ignore code identifiers (camelCase/PascalCase) composed of natural word chunks
-            word_chunks = re.findall(r"[A-Z]?[a-z]{3,}", token)
-            if len(word_chunks) >= 3 and sum(len(w) for w in word_chunks) / len(token) > 0.55:
-                continue
-            # Ignore file names with common extensions
-            if re.search(r"\.(?:js|ts|py|json|html|css|jsx|tsx|go|rs|cpp|h|java|png|jpg|svg|lock|md)$", token, re.IGNORECASE):
-                continue
-            # Ignore path separators or URLs
-            if "/" in token or "\\" in token or token.startswith("http"):
-                continue
-
-            if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
-                h = calculate_shannon_entropy(token)
-                if h >= 4.15:
-                    ph = self.register_secret(token, "ENTROPY_KEY", is_dynamic=True)
-                    found.append((token, ph))
-
-        # 5. IPv4 Addresses (Local & Public)
-        for m in self.ipv4_pattern.finditer(text):
-            ip = m.group(1)
-            if ip in self.ipv4_exempt or ip in self.secret_to_placeholder or ip.startswith("__VAULT_"):
-                continue
-            start_pos = m.start()
-            if start_pos > 0 and text[start_pos - 1] in ("v", "V", "/"):
-                continue
-            preceding = text[max(0, start_pos - 20):start_pos]
-            if re.search(r"\b(?:version|ver|release|rel)\b", preceding, re.IGNORECASE):
-                continue
-
-            clean_ip = ip.split("/")[0]
-            if clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", clean_ip):
-                ph = self.register_secret(ip, "LOCAL_IP", is_dynamic=True)
-            else:
-                ph = self.register_secret(ip, "IP_ADDR", is_dynamic=True)
-            found.append((ip, ph))
-
-        # 6. IPv6 Addresses (Validated strictly with ipaddress module)
-        for m in self.ipv6_candidate_pattern.finditer(text):
-            cand = m.group(1)
-            if cand.count(":") < 2:
-                continue
-            try:
-                ip_obj = ipaddress.IPv6Address(cand)
-                # Ignore loopback, unspecified, multicast, and IANA reserved ranges (prevents masking code identifiers like a::b or face::cafe)
-                if ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_multicast or ip_obj.is_reserved:
+            # 1. Contextual assignments in code and JSON with quoted keys & values
+            for m in self.assignment_pattern.finditer(text):
+                var_name = m.group(1)
+                val = m.group(2)
+                var_lower = var_name.lower()
+                if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
                     continue
-                # Reject code identifiers or trivial 2-hextet values without colons/digits (e.g. a::b, face::cafe)
-                parts = [p for p in cand.split(":") if p]
-                if len(parts) < 3 and cand.count(":") < 3:
+                if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
                     continue
-                if cand in self.secret_to_placeholder or cand.startswith("__VAULT_"):
+                if val and val.strip().lower() in DUMMY_VALUES:
                     continue
-                ph = self.register_secret(cand, "IPV6_ADDR", is_dynamic=True)
-                found.append((cand, ph))
-            except ValueError:
-                continue
+                if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
+                    ph = self.register_secret(val, var_name, is_dynamic=True)
+                    found.append((val, ph))
 
-        if self.state_file and len(self.dynamic_secrets) > initial_count:
-            self.save_state()
+            # 1.1 YAML / bare config assignments on individual lines
+            for m in self.yaml_assignment_pattern.finditer(text):
+                var_name = m.group(1)
+                val = m.group(2).strip().rstrip(";,")
+                var_lower = var_name.lower()
+                if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
+                    continue
+                if any(var_lower.startswith(pfx) for pfx in NON_SECRET_VAR_PREFIXES):
+                    continue
+
+                val_lower = val.lower()
+                if val_lower in DUMMY_VALUES or val_lower in IGNORE_ENV_VALUES or val_lower in NON_SECRET_TYPES:
+                    continue
+
+                # Skip type annotations like Optional[str], List[string], Array<string>, etc.
+                if any(val_lower.startswith(t_pfx) for t_pfx in ("optional[", "list[", "dict[", "set[", "tuple[", "array<", "map<", "record<")):
+                    continue
+
+                # Skip template expressions and environment substitutions (${VAR}, $VAR, {{VAR}})
+                if "${" in val or "}}" in val or val.startswith("$") or (val.startswith("<") and val.endswith(">")):
+                    continue
+
+                # Filter out identifiers/words without digits, without symbols, and without mixed case:
+                # A genuine bare config secret has digits, symbols, or mixed case.
+                # Pure letters in single case (e.g. 'string', 'password', 'custom') are code words/types.
+                has_digits = any(c.isdigit() for c in val)
+                has_symbols = any(c in "-_./@=+!#$%&*?" for c in val)
+                is_mixed_case = any(c.islower() for c in val) and any(c.isupper() for c in val)
+                if not (has_digits or has_symbols or is_mixed_case):
+                    continue
+
+                if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
+                    ph = self.register_secret(val, var_name, is_dynamic=True)
+                    found.append((val, ph))
+
+            # 1.1 Bearer tokens in Authorization headers / curl
+            for m in self.bearer_pattern.finditer(text):
+                tok = m.group(1).strip()
+                if tok and tok.lower() not in DUMMY_VALUES and tok not in self.secret_to_placeholder and not tok.startswith("__VAULT_"):
+                    ph = self.register_secret(tok, "BEARER_TOKEN", is_dynamic=True)
+                    found.append((tok, ph))
+
+            # 2. Environment exports
+            for m in self.env_pattern.finditer(text):
+                var_name = m.group(1)
+                val = m.group(2)
+                var_lower = var_name.lower()
+                if any(var_lower.endswith(sfx) for sfx in NON_SECRET_VAR_SUFFIXES):
+                    continue
+                if val and (val.strip().lower() in DUMMY_VALUES or val.strip().lower() in IGNORE_ENV_VALUES):
+                    continue
+                if val and val not in self.secret_to_placeholder and not val.startswith("__VAULT_"):
+                    ph = self.register_secret(val, var_name, is_dynamic=True)
+                    found.append((val, ph))
+
+            # 3. Signature patterns
+            for pattern, label in self.signature_patterns:
+                matches = re.findall(pattern, text)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        match = match[0]
+                    if match and len(match) >= 8 and not match.startswith("__VAULT_"):
+                        if match not in self.secret_to_placeholder:
+                            ph = self.register_secret(match, label, is_dynamic=True)
+                            found.append((match, ph))
+
+            # 4. Shannon Entropy analysis for arbitrary high-entropy tokens (>=20 chars)
+            # Strip data URIs and long base64 blocks so image/audio blobs are not chopped into false-positive secrets
+            text_for_entropy = re.sub(r"data:[a-zA-Z0-9/+.\-]+;base64,[A-Za-z0-9+/=]+", " ", text)
+            text_for_entropy = re.sub(r"[A-Za-z0-9+/]{64,}={0,2}", " ", text_for_entropy)
+
+            potential_tokens = re.findall(r"\b[A-Za-z0-9_\-\.]{20,}\b", text_for_entropy)
+            for token in potential_tokens:
+                if token in self.secret_to_placeholder or token.startswith("__VAULT_"):
+                    continue
+                if any(token.startswith(pfx) for pfx in ("call_", "toolu_", "chatcmpl-", "msg_", "resp_", "ft:", "gpt-", "claude-")):
+                    continue
+                # Ignore pure hex strings of length 32, 40, 64 (MD5, Git SHA-1, SHA-256 / Webpack hashes)
+                if re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", token):
+                    continue
+                # Ignore PascalCase / camelCase code identifiers composed of natural dictionary words
+                if any(c.isupper() for c in token):
+                    word_chunks = re.findall(r"[A-Z][a-z]{2,}", token)
+                    if len(word_chunks) >= 2 and sum(len(w) for w in word_chunks) / len(token) > 0.60:
+                        continue
+                # Ignore file names with common extensions
+                if re.search(r"\.(?:js|ts|py|json|html|css|jsx|tsx|go|rs|cpp|h|java|png|jpg|svg|lock|md)$", token, re.IGNORECASE):
+                    continue
+                # Ignore variable names / file stems with words joined by underscore
+                if "_" in token:
+                    subwords = [w.lower() for w in token.split("_") if w]
+                    if any(sw in DUMMY_VALUES or sw in IGNORE_ENV_VALUES or sw in ("password", "passwd", "secret", "token", "key", "backup", "temp", "file") for sw in subwords):
+                        continue
+                # Ignore path separators or URLs
+                if "/" in token or "\\" in token or token.startswith("http"):
+                    continue
+
+                if re.search(r"[A-Za-z]", token) and re.search(r"[0-9]", token):
+                    h = calculate_shannon_entropy(token)
+                    if h >= 3.70:
+                        ph = self.register_secret(token, "ENTROPY_KEY", is_dynamic=True)
+                        found.append((token, ph))
+
+            # 5. IPv4 Addresses (Local & Public)
+            for m in self.ipv4_pattern.finditer(text):
+                ip = m.group(1)
+                if ip in self.ipv4_exempt or ip in self.secret_to_placeholder or ip.startswith("__VAULT_"):
+                    continue
+                start_pos = m.start()
+                if start_pos > 0 and text[start_pos - 1] in ("v", "V", "/"):
+                    continue
+                preceding = text[max(0, start_pos - 20):start_pos]
+                if re.search(r"\b(?:version|ver|release|rel)\b", preceding, re.IGNORECASE):
+                    continue
+
+                clean_ip = ip.split("/")[0]
+                if clean_ip.startswith("192.168.") or clean_ip.startswith("10.") or re.match(r"^172\.(1[6-9]|2[0-9]|3[0-1])\.", clean_ip):
+                    ph = self.register_secret(ip, "LOCAL_IP", is_dynamic=True)
+                else:
+                    ph = self.register_secret(ip, "IP_ADDR", is_dynamic=True)
+                found.append((ip, ph))
+
+            # 6. IPv6 Addresses (Validated strictly with ipaddress module)
+            for m in self.ipv6_candidate_pattern.finditer(text):
+                cand = m.group(1)
+                if cand.count(":") < 2:
+                    continue
+                try:
+                    ip_obj = ipaddress.IPv6Address(cand)
+                    # Ignore loopback, unspecified, multicast, and IANA reserved ranges (prevents masking code identifiers like a::b or face::cafe)
+                    if ip_obj.is_loopback or ip_obj.is_unspecified or ip_obj.is_multicast or ip_obj.is_reserved:
+                        continue
+                    # Reject code identifiers or trivial 2-hextet values without colons/digits (e.g. a::b, face::cafe)
+                    parts = [p for p in cand.split(":") if p]
+                    if len(parts) < 3 and cand.count(":") < 3:
+                        continue
+                    if cand in self.secret_to_placeholder or cand.startswith("__VAULT_"):
+                        continue
+                    ph = self.register_secret(cand, "IPV6_ADDR", is_dynamic=True)
+                    found.append((cand, ph))
+                except ValueError:
+                    continue
+
+            if self.state_file and len(self.dynamic_secrets) > initial_count:
+                self.save_state()
 
         return found
 
@@ -568,32 +634,33 @@ class SecretVault:
         if not text:
             return text, 0
 
-        self.scan_and_register_dynamic(text)
+        with self._lock:
+            self.scan_and_register_dynamic(text)
 
-        if not self.secret_to_placeholder:
-            return text, 0
+            if not self.secret_to_placeholder:
+                return text, 0
 
-        if self._mask_regex is None:
-            sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
-            patterns = []
-            for s in sorted_secrets:
-                esc = re.escape(s)
-                # Word boundaries ONLY for short alphanumeric secrets (< 8 chars) to prevent substring collisions (e.g. abc in abcdef)
-                # Longer secrets (>= 8 chars, like hunter2hunter2) are masked as normal substrings
-                if len(s) < 8 and re.fullmatch(r"^\w+$", s):
-                    patterns.append(rf"\b{esc}\b")
-                else:
-                    patterns.append(esc)
-            self._mask_regex = re.compile("|".join(patterns))
+            if self._mask_regex is None:
+                sorted_secrets = sorted(self.secret_to_placeholder.keys(), key=len, reverse=True)
+                patterns = []
+                for s in sorted_secrets:
+                    esc = re.escape(s)
+                    # Word boundaries ONLY for short alphanumeric secrets (< 8 chars) to prevent substring collisions (e.g. abc in abcdef)
+                    # Longer secrets (>= 8 chars, like hunter2hunter2) are masked as normal substrings
+                    if len(s) < 8 and re.fullmatch(r"^\w+$", s):
+                        patterns.append(rf"\b{esc}\b")
+                    else:
+                        patterns.append(esc)
+                self._mask_regex = re.compile("|".join(patterns))
 
-        replacements = 0
-        def _replace_secret(match: re.Match) -> str:
-            nonlocal replacements
-            replacements += 1
-            return self.secret_to_placeholder[match.group(0)]
+            replacements = 0
+            def _replace_secret(match: re.Match) -> str:
+                nonlocal replacements
+                replacements += 1
+                return self.secret_to_placeholder[match.group(0)]
 
-        masked = self._mask_regex.sub(_replace_secret, text)
-        return masked, replacements
+            masked = self._mask_regex.sub(_replace_secret, text)
+            return masked, replacements
 
     def mask_payload(self, data: Any) -> Tuple[Any, int]:
         """
@@ -641,24 +708,25 @@ class SecretVault:
         if not text or not self.placeholder_to_secret:
             return text, 0
 
-        if self._demask_regex is None:
-            sorted_placeholders = sorted(self.placeholder_to_secret.keys(), key=len, reverse=True)
-            self._demask_regex = re.compile("|".join(re.escape(ph) for ph in sorted_placeholders))
+        with self._lock:
+            if self._demask_regex is None:
+                sorted_placeholders = sorted(self.placeholder_to_secret.keys(), key=len, reverse=True)
+                self._demask_regex = re.compile("|".join(re.escape(ph) for ph in sorted_placeholders))
 
-        restorations = 0
-        def _replace_placeholder(match: re.Match) -> str:
-            nonlocal restorations
-            placeholder = match.group(0)
-            real_secret = self.placeholder_to_secret[placeholder]
-            restorations += 1
-            if self.on_demask:
-                self.on_demask(placeholder, real_secret)
-            if json_escaped:
-                return json.dumps(real_secret)[1:-1]
-            return real_secret
+            restorations = 0
+            def _replace_placeholder(match: re.Match) -> str:
+                nonlocal restorations
+                placeholder = match.group(0)
+                real_secret = self.placeholder_to_secret[placeholder]
+                restorations += 1
+                if self.on_demask:
+                    self.on_demask(placeholder, real_secret)
+                if json_escaped:
+                    return json.dumps(real_secret)[1:-1]
+                return real_secret
 
-        result = self._demask_regex.sub(_replace_placeholder, text)
-        return result, restorations
+            result = self._demask_regex.sub(_replace_placeholder, text)
+            return result, restorations
 
     def demask_payload(self, data: Any) -> Tuple[Any, int]:
         """
@@ -778,6 +846,7 @@ class SSEStreamDemasker:
     Supports OpenAI Chat Completions, Responses API, Anthropic, and streaming tool calls.
     Flushes buffers proactively on finish_reason, content_block_stop, response.output_text.done, and [DONE].
     NEVER demasks thinking, reasoning, or signature events in the stream.
+    Strictly preserves SSE event headers (e.g. event: content_block_stop) and formats synthetic deltas.
     """
     def __init__(self, vault: SecretVault):
         self.vault = vault
@@ -786,11 +855,19 @@ class SSEStreamDemasker:
         self.stream_demaskers: Dict[str, TextStreamDemasker] = {}
         self.last_responses_event: Optional[Dict[str, Any]] = None
         self.saw_choices: bool = False
+        self.pending_event_lines: List[str] = []
 
     def _get_stream_demasker(self, key: str, json_escaped: bool = False) -> TextStreamDemasker:
         if key not in self.stream_demaskers:
             self.stream_demaskers[key] = TextStreamDemasker(self.vault, json_escaped=json_escaped)
         return self.stream_demaskers[key]
+
+    def _emit_pending_events(self, output: List[str]):
+        if self.pending_event_lines:
+            for pel in self.pending_event_lines:
+                demasked_line, _ = self.vault.demask_text(pel)
+                output.append(demasked_line + "\n")
+            self.pending_event_lines.clear()
 
     def process_raw_chunk(self, chunk: str) -> str:
         self.raw_line_buffer += chunk
@@ -801,7 +878,12 @@ class SSEStreamDemasker:
             line = line.rstrip("\r")
 
             if not line:
+                self._emit_pending_events(output)
                 output.append("\n")
+                continue
+
+            if line.startswith(("event:", "id:", "retry:")):
+                self.pending_event_lines.append(line)
                 continue
 
             if line.startswith("data:"):
@@ -811,6 +893,7 @@ class SSEStreamDemasker:
                     flushed = self.flush_internal()
                     if flushed:
                         output.append(flushed)
+                    self._emit_pending_events(output)
                     output.append("data: [DONE]\n")
                     continue
 
@@ -919,7 +1002,6 @@ class SSEStreamDemasker:
                                             choice.setdefault("delta", {})["content"] = flushed_c
                                         modified = True
 
-                                    # Proactively flush tool_calls stream demaskers for this choice index
                                     prefix = f"openai_tc_{c_idx}_"
                                     for key in list(self.stream_demaskers.keys()):
                                         if key.startswith(prefix):
@@ -976,7 +1058,7 @@ class SSEStreamDemasker:
                                     "index": block_idx,
                                     "delta": {"type": "text_delta", "text": flushed_c}
                                 }
-                                output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+                                output.append(f"event: content_block_delta\ndata: {json.dumps(synth, ensure_ascii=False)}\n\n")
 
                             if flushed_tc:
                                 synth_tc = {
@@ -984,17 +1066,20 @@ class SSEStreamDemasker:
                                     "index": block_idx,
                                     "delta": {"type": "input_json_delta", "partial_json": flushed_tc}
                                 }
-                                output.append(f"data: {json.dumps(synth_tc, ensure_ascii=False)}\n\n")
+                                output.append(f"event: content_block_delta\ndata: {json.dumps(synth_tc, ensure_ascii=False)}\n\n")
 
                     if not modified and isinstance(event_data, (dict, list)):
                         event_data, _ = self.vault.demask_payload(event_data)
 
+                    self._emit_pending_events(output)
                     output.append(f"data: {json.dumps(event_data, ensure_ascii=False)}\n")
 
                 except Exception:
+                    self._emit_pending_events(output)
                     demasked_line, _ = self.vault.demask_text(line)
                     output.append(demasked_line + "\n")
             else:
+                self._emit_pending_events(output)
                 demasked_line, _ = self.vault.demask_text(line)
                 output.append(demasked_line + "\n")
 
@@ -1021,7 +1106,7 @@ class SSEStreamDemasker:
                     except Exception:
                         b_idx = 0
                     synth = {"type": "content_block_delta", "index": b_idx, "delta": {"type": "input_json_delta", "partial_json": flushed_extra}}
-                    output.append(f"data: {json.dumps(synth, ensure_ascii=False)}\n\n")
+                    output.append(f"event: content_block_delta\ndata: {json.dumps(synth, ensure_ascii=False)}\n\n")
                 elif key.startswith("openai_tc_"):
                     parts = key.split("_")
                     c_idx = int(parts[2]) if len(parts) > 2 else 0
@@ -1042,6 +1127,7 @@ class SSEStreamDemasker:
 
     def flush(self) -> str:
         output = [self.flush_internal()]
+        self._emit_pending_events(output)
         if self.raw_line_buffer:
             demasked_rem, _ = self.vault.demask_text(self.raw_line_buffer)
             output.append(demasked_rem)

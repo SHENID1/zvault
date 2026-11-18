@@ -175,9 +175,28 @@ class PromptInjectionGuard:
 
         for patterns, weight in pattern_groups:
             for pattern, label in patterns:
-                if (re.search(pattern, text) or
-                    re.search(pattern, normalized_text) or
-                    re.search(pattern, latin_text)):
+                found_match = False
+                for target_str in (text, normalized_text, latin_text):
+                    for m in re.finditer(pattern, target_str):
+                        matched_str = m.group(0).lower()
+                        # If matching INSTRUCTION_OVERRIDE, check if it's benign coding/linting/compiler rules
+                        if "INSTRUCTION_OVERRIDE" in label:
+                            context_str = target_str[max(0, m.start() - 25):min(len(target_str), m.end() + 35)].lower()
+                            # Check English linter/coding rules
+                            if re.search(r"\b(?:lint(?:er)?|eslint|tslint|flake8|pylint|ruff|prettier|formatting|style|type(?:s|script)?|typing|type-?check(?:ing)?|compiler|warning|warnings|validation|code\s*style)\s+(?:rules?|guidelines?|constraints?|checks?)\b", context_str):
+                                if not re.search(r"\b(?:instructions?|prompts?|directives?)\b", context_str):
+                                    continue
+                            # Check Russian linter/coding rules (words can precede or follow "правила")
+                            if (re.search(r"\b(?:линтер[а-я]*|eslint|tslint|форматировани[а-я]*|стил[а-я]*|типизаци[а-я]*|компилятор[а-я]*|предупреждени[а-я]*)\s+(?:правил[а-я]*|ограничени[а-я]*)\b", context_str) or
+                                re.search(r"\b(?:правил[а-я]*|ограничени[а-я]*)\s+(?:линтер[а-я]*|eslint|tslint|форматировани[а-я]*|стил[а-я]*|типизаци[а-я]*)\b", context_str)):
+                                if not re.search(r"\b(?:инструкци[а-я]*|промпт[а-я]*|указани[а-я]*|директив[а-я]*)\b", context_str):
+                                    continue
+                        found_match = True
+                        break
+                    if found_match:
+                        break
+
+                if found_match:
                     matched.append(label)
                     base_score = max(base_score, weight)
                     if not highest_category:
@@ -297,13 +316,15 @@ class PromptInjectionGuard:
     def scan_payload(self, body_json: Any) -> InjectionResult:
         """
         Deep-scans an entire LLM request payload, distinguishing source contexts:
-        - user: direct user messages and input (high risk: blocked by default if malicious)
-        - tool_result: outputs from tools read by agent (warning only, prevents agent loop deadlock)
+        - user: direct user messages and input (high risk: blocked if malicious)
+        - tool_result: outputs from tools read by agent (indirect prompt injection: blocked if malicious)
+        - assistant: model's own prior messages & generated tool calls (warning only, prevents 400 self-lock)
         - tools: tool definitions & descriptions (warning only)
         - system: system prompt (warning only)
         """
         user_bucket = []
         tool_results_bucket = []
+        assistant_bucket = []
         tools_def_bucket = []
         system_bucket = []
 
@@ -340,20 +361,32 @@ class PromptInjectionGuard:
                 untrusted_inputs = self._extract_untrusted_elements(input_data)
                 for item in untrusted_inputs:
                     if isinstance(item, dict):
-                        if "output" in item:
-                            tool_results_bucket.append(str(item["output"]))
-                        if "content" in item:
-                            c = item["content"]
-                            if isinstance(c, str):
-                                user_bucket.append(c)
-                            elif isinstance(c, list):
-                                for part in c:
-                                    if isinstance(part, dict) and "text" in part:
-                                        user_bucket.append(str(part["text"]))
-                        if "arguments" in item and isinstance(item["arguments"], str):
-                            user_bucket.append(item["arguments"])
-                        if "call_id" in item and isinstance(item["call_id"], str):
-                            user_bucket.append(item["call_id"])
+                        item_type = str(item.get("type", "")).lower()
+                        item_role = str(item.get("role", "")).lower()
+                        if item_type in ("function_call_output", "tool_result") or "output" in item:
+                            tool_results_bucket.append(str(item.get("output", "")))
+                        elif item_type in ("function_call", "tool_call") or item_role == "assistant":
+                            if "arguments" in item and isinstance(item["arguments"], str):
+                                assistant_bucket.append(item["arguments"])
+                            if "content" in item:
+                                c = item["content"]
+                                if isinstance(c, str):
+                                    assistant_bucket.append(c)
+                                elif isinstance(c, list):
+                                    for part in c:
+                                        if isinstance(part, dict) and "text" in part:
+                                            assistant_bucket.append(str(part["text"]))
+                        else:
+                            if "content" in item:
+                                c = item["content"]
+                                if isinstance(c, str):
+                                    user_bucket.append(c)
+                                elif isinstance(c, list):
+                                    for part in c:
+                                        if isinstance(part, dict) and "text" in part:
+                                            user_bucket.append(str(part["text"]))
+                            if "call_id" in item and isinstance(item["call_id"], str):
+                                user_bucket.append(item["call_id"])
                     elif isinstance(item, str):
                         user_bucket.append(item)
             elif isinstance(input_data, str):
@@ -365,12 +398,15 @@ class PromptInjectionGuard:
                 untrusted_messages = self._extract_untrusted_elements(messages)
                 for msg in untrusted_messages:
                     if isinstance(msg, dict):
-                        role = msg.get("role", "user")
-                        target_bucket = user_bucket
+                        role = str(msg.get("role", "user")).lower()
                         if role in ("tool", "function"):
                             target_bucket = tool_results_bucket
                         elif role == "system":
                             target_bucket = system_bucket
+                        elif role == "assistant":
+                            target_bucket = assistant_bucket
+                        else:
+                            target_bucket = user_bucket
 
                         content = msg.get("content", "")
                         if isinstance(content, str):
@@ -401,7 +437,7 @@ class PromptInjectionGuard:
                         if isinstance(tcid, str):
                             target_bucket.append(tcid)
 
-                        # Scan tool_calls arguments
+                        # Scan tool_calls arguments (belongs to assistant)
                         tool_calls = msg.get("tool_calls")
                         if isinstance(tool_calls, list):
                             for tc in tool_calls:
@@ -410,10 +446,10 @@ class PromptInjectionGuard:
                                     if isinstance(func, dict):
                                         args = func.get("arguments")
                                         if isinstance(args, str):
-                                            user_bucket.append(args)
+                                            assistant_bucket.append(args)
                                         fn_name = func.get("name")
                                         if isinstance(fn_name, str):
-                                            user_bucket.append(fn_name)
+                                            assistant_bucket.append(fn_name)
                     elif isinstance(msg, str):
                         user_bucket.append(msg)
 
@@ -433,15 +469,23 @@ class PromptInjectionGuard:
                 res_user.should_block = True
                 return res_user
 
-        # 2. Evaluate Tool Results (Warning only: prevents cycle deadlock if agent reads a file with injection text)
+        # 2. Evaluate Tool Results (Indirect Prompt Injection: blockable in block mode)
         if tool_results_bucket:
             res_tr = self.scan_text("\n".join(tool_results_bucket))
             if res_tr.is_malicious:
                 res_tr.source = "tool_result"
-                res_tr.should_block = False
+                res_tr.should_block = True
                 return res_tr
 
-        # 3. Evaluate Tool Definitions (Warning only: prevents blocking legitimate tools)
+        # 3. Evaluate Assistant Messages & Tool Calls (Warning only: never blocks request)
+        if assistant_bucket:
+            res_asst = self.scan_text("\n".join(assistant_bucket))
+            if res_asst.is_malicious:
+                res_asst.source = "assistant"
+                res_asst.should_block = False
+                return res_asst
+
+        # 4. Evaluate Tool Definitions (Warning only: prevents blocking legitimate tools)
         if tools_def_bucket:
             res_tools = self.scan_text("\n".join(tools_def_bucket))
             if res_tools.is_malicious:
@@ -449,7 +493,7 @@ class PromptInjectionGuard:
                 res_tools.should_block = False
                 return res_tools
 
-        # 4. Evaluate System Prompts (Warning only)
+        # 5. Evaluate System Prompts (Warning only)
         if system_bucket:
             res_sys = self.scan_text("\n".join(system_bucket))
             if res_sys.is_malicious:

@@ -129,11 +129,15 @@ def cmd_start(args):
     else:
         print(f"Starting {CYAN}{BOLD}ZVault{RESET} on {GREEN}{BASE_URL}{RESET}...", end=" ", flush=True)
 
+        log_f = open(LOG_FILE, "a", encoding="utf-8")
         if sys.platform == "win32":
-            creationflags = 0x00000010  # CREATE_NEW_CONSOLE
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
             proc = subprocess.Popen(
                 [python_exe, SERVER_PY],
                 cwd=PROXY_DIR,
+                stdout=log_f,
+                stderr=log_f,
+                stdin=subprocess.DEVNULL,
                 creationflags=creationflags
             )
             bg_pid = str(proc.pid)
@@ -143,9 +147,10 @@ def cmd_start(args):
             proc = subprocess.Popen(
                 [python_exe, SERVER_PY],
                 cwd=PROXY_DIR,
+                stdout=log_f,
+                stderr=log_f,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                start_new_session=True
             )
             with open(PID_FILE, "w") as f:
                 f.write(str(proc.pid))
@@ -169,10 +174,38 @@ def cmd_start(args):
 
 def cmd_stop():
     """Stops the running proxy."""
+    if not is_running():
+        if os.path.exists(PID_FILE):
+            try:
+                os.remove(PID_FILE)
+            except Exception:
+                pass
+        print(f"{GREEN}{BOLD}✓ ZVault is not running.{RESET}")
+        return
+
     pid = get_pid()
     stopped = False
 
-    if pid:
+    # Find processes listening strictly on :PORT
+    listening_pids = set()
+    try:
+        if sys.platform == "win32":
+            netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+            port_regex = re.compile(rf":{PORT}\s")
+            for line in netstat.stdout.splitlines():
+                if port_regex.search(line) and "LISTENING" in line:
+                    parts = line.strip().split()
+                    listening_pids.add(parts[-1])
+        else:
+            lsof = subprocess.run(["lsof", "-t", "-sTCP:LISTEN", f"-i:{PORT}"], capture_output=True, text=True)
+            for p in lsof.stdout.strip().splitlines():
+                if p.strip():
+                    listening_pids.add(p.strip())
+    except Exception:
+        pass
+
+    # If pid from PID_FILE is actively listening on our port, terminate it
+    if pid and str(pid) in listening_pids:
         try:
             if sys.platform == "win32":
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)], capture_output=True)
@@ -181,26 +214,16 @@ def cmd_stop():
             stopped = True
         except Exception:
             pass
+        listening_pids.discard(str(pid))
 
-    # If PID file was stale or missing, find process listening strictly on :PORT (listening sockets only!)
-    if not stopped or is_running():
+    # Terminate any remaining processes confirmed to be listening on :PORT
+    for lp in listening_pids:
         try:
             if sys.platform == "win32":
-                netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
-                port_regex = re.compile(rf":{PORT}\s")
-                for line in netstat.stdout.splitlines():
-                    if port_regex.search(line) and "LISTENING" in line:
-                        parts = line.strip().split()
-                        port_pid = parts[-1]
-                        subprocess.run(["taskkill", "/F", "/PID", port_pid], capture_output=True)
-                        stopped = True
+                subprocess.run(["taskkill", "/F", "/PID", lp], capture_output=True)
             else:
-                # -sTCP:LISTEN strictly matches listening server processes, not client sockets (e.g. IDE)
-                lsof = subprocess.run(["lsof", "-t", "-sTCP:LISTEN", f"-i:{PORT}"], capture_output=True, text=True)
-                for p in lsof.stdout.strip().splitlines():
-                    if p:
-                        os.kill(int(p), signal.SIGKILL)
-                        stopped = True
+                os.kill(int(lp), signal.SIGTERM)
+            stopped = True
         except Exception:
             pass
 
