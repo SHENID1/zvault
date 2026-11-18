@@ -12,6 +12,7 @@
     "api.anthropic.com"
   ],
   "secrets_file": "secrets.json",
+  "state_ttl": 86400,
   "env_files": [
     ".env"
   ],

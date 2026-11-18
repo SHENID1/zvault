@@ -613,11 +613,33 @@ class SecretVault:
                     word_chunks = re.findall(r"[A-Z][a-z]{2,}", token)
                     if len(word_chunks) >= 2 and sum(len(w) for w in word_chunks) / len(token) > 0.60:
                         continue
-                # Ignore code identifiers composed of 3+ segments separated by [_.-] where majority of segments are words of length >= 3
+                # Inspect multi-segment tokens (separated by [_.-])
                 if any(sep in token for sep in ("_", "-", ".")):
                     segments = [s for s in re.split(r"[_\-\.]", token) if s]
                     if len(segments) >= 3:
                         word_segments = [s for s in segments if s.isalpha() and len(s) >= 3]
+                        non_word_segments = [s for s in segments if not (s.isalpha() and len(s) >= 3)]
+
+                        # Check if any non-word segment looks like a high-entropy secret (e.g. random key suffix)
+                        has_random_segment = False
+                        for s in non_word_segments:
+                            if len(s) >= 16:
+                                # Skip pure hex hashes of standard lengths (Git commit SHA, MD5, SHA-256)
+                                if re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", s):
+                                    continue
+                                has_letters_and_digits = any(c.isalpha() for c in s) and any(c.isdigit() for c in s)
+                                has_mixed_case = any(c.islower() for c in s) and any(c.isupper() for c in s)
+                                if (has_letters_and_digits or has_mixed_case) and calculate_shannon_entropy(s) >= 3.5:
+                                    has_random_segment = True
+                                    break
+
+                        if has_random_segment:
+                            # Token contains a high-entropy secret segment (e.g. live_secret_key_<random>)
+                            ph = self.register_secret(token, "ENTROPY_KEY", is_dynamic=True)
+                            found.append((token, ph))
+                            continue
+
+                        # If all non-word segments are benign and majority of segments are dictionary words, skip as code identifier
                         if len(word_segments) / len(segments) >= 0.5:
                             continue
                 # Ignore file names with common extensions

@@ -122,7 +122,8 @@ env_files = [
     ef if os.path.isabs(ef) else os.path.normpath(os.path.join(PROXY_DIR, ef))
     for ef in raw_env_files
 ]
-vault = SecretVault(secrets_path, env_files=env_files, state_file=state_file_path)
+state_ttl = int(config.get("state_ttl", 86400))
+vault = SecretVault(secrets_path, env_files=env_files, state_file=state_file_path, state_ttl=state_ttl)
 vault.on_demask = lambda ph, sec: log_demask(f"Restored placeholder {ph} in response stream!")
 
 injection_cfg = config.get("injection_guard", {"enabled": True, "action": "block", "sensitivity": 0.65})

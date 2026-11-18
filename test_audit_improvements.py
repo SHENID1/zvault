@@ -1068,6 +1068,32 @@ service_token: MySecretToken99
         self.assertEqual(count_long, 1)
         self.assertNotIn(long_segmented_secret, masked_long)
 
+    # --- 46b. Multi-segment secrets with word prefix and random tail are detected and masked ---
+    def test_multi_segment_secrets_with_word_prefix_detected(self):
+        import secrets
+        vault = SecretVault()
+
+        tail20 = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(20))
+        tail24 = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(24))
+        tail22 = "".join(secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789") for _ in range(22))
+
+        k1 = f"live_secret_key_{tail20}"
+        k2 = f"prod-api-key-{tail24}"
+        k3 = f"my_service_token_{tail22}"
+
+        text = f"Credentials: key1={k1}, key2={k2}, key3={k3}"
+        masked, count = vault.mask_text(text)
+
+        self.assertNotIn(k1, masked)
+        self.assertNotIn(k2, masked)
+        self.assertNotIn(k3, masked)
+        self.assertEqual(count, 3)
+
+        # Demask back to verify round-trip
+        demasked, d_count = vault.demask_text(masked)
+        self.assertEqual(d_count, 3)
+        self.assertEqual(demasked, text)
+
     # --- 47. Known secret (e.g. 'abc') does not suppress entropy detection of surrounding tokens ---
     def test_known_secret_does_not_suppress_entropy_detection(self):
         vault = SecretVault()
