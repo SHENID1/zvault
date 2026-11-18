@@ -10,7 +10,14 @@ from contextlib import asynccontextmanager
 from urllib.parse import urlparse
 from typing import Dict, Any, Optional
 
-# Ensure sys.stdout and sys.stderr are valid when running in background under pythonw
+# Ensure sys.stdout and sys.stderr are valid and handle UTF-8 gracefully without crashing on Windows codepages (cp1251, cp866)
+for _s in (sys.stdout, sys.stderr):
+    if _s is not None and hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 if sys.stdout is None or sys.stderr is None:
     try:
         _log_f = open(os.path.join(os.path.dirname(__file__), "proxy.log"), "a", encoding="utf-8", buffering=1)
@@ -157,13 +164,13 @@ def log_shield(msg: str):
     print(f"{CYAN}{BOLD}[SHIELD]{RESET} {msg}")
 
 def log_mask(msg: str):
-    print(f"{YELLOW}{BOLD}[MASK 🔒]{RESET} {msg}")
+    print(f"{YELLOW}{BOLD}[MASK]{RESET} {msg}")
 
 def log_demask(msg: str):
-    print(f"{GREEN}{BOLD}[DEMASK 🔓]{RESET} {msg}")
+    print(f"{GREEN}{BOLD}[DEMASK]{RESET} {msg}")
 
 def log_warn(msg: str):
-    print(f"{RED}{BOLD}[WARN ⚠️]{RESET} {msg}")
+    print(f"{RED}{BOLD}[WARN]{RESET} {msg}")
 
 
 @app.middleware("http")
@@ -338,13 +345,13 @@ def process_multipart_payload(
             if inj_res.is_malicious:
                 action = injection_cfg.get("action", "block").lower()
                 if action == "block":
-                    log_warn(f"🛑 BLOCKED PROMPT INJECTION in multipart file/field! Risk: {inj_res.risk_score}")
+                    log_warn(f"BLOCKED PROMPT INJECTION in multipart file/field! Risk: {inj_res.risk_score}")
                     raise HTTPException(
                         status_code=400,
                         detail=f"Request blocked by ZVault Prompt Injection Guard (multipart): {inj_res.category}"
                     )
                 else:
-                    log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION in multipart! Risk: {inj_res.risk_score}")
+                    log_warn(f"SUSPICIOUS PROMPT INJECTION in multipart! Risk: {inj_res.risk_score}")
 
         # Mask secrets in textual part
         masked_text, count = vault.mask_text(body_text)
@@ -424,10 +431,10 @@ async def proxy_request_handler(target_url: str, request: Request) -> Response:
                 if inj_res.is_malicious:
                     action = injection_cfg.get("action", "block").lower()
                     if action == "block" and inj_res.should_block:
-                        log_warn(f"🛑 BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
+                        log_warn(f"BLOCKED PROMPT INJECTION! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
                         raise HTTPException(status_code=400, detail=f"Request blocked by ZVault Prompt Injection Guard: {inj_res.category}")
                     else:
-                        log_warn(f"🚨 SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
+                        log_warn(f"SUSPICIOUS PROMPT INJECTION (Warning only)! Risk: {inj_res.risk_score}, Category: {inj_res.category}, Matches: {inj_res.matched_patterns} (Source: {inj_res.source})")
 
             masked_json, count = await asyncio.to_thread(vault.mask_payload, body_json)
             if count > 0:
@@ -731,7 +738,7 @@ if __name__ == "__main__":
     host = config.get("host", "127.0.0.1")
     port = int(config.get("port", 8765))
     print(f"\n{CYAN}{BOLD}=================================================={RESET}")
-    print(f"{CYAN}{BOLD}   🛡️  ZCode Secret Masking Proxy v1.1.1   {RESET}")
+    print(f"{CYAN}{BOLD}   [ZVault] ZCode Secret Masking Proxy v1.1.1   {RESET}")
     print(f"{CYAN}{BOLD}=================================================={RESET}")
     print(f"Server starting on: {GREEN}http://{host}:{port}{RESET}")
     print(f"Registered upstreams: {YELLOW}{list(config.get('upstreams', {}).keys())}{RESET}")

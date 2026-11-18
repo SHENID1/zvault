@@ -10,6 +10,14 @@ import urllib.request
 import urllib.error
 from typing import Dict, Any, Optional
 
+# Ensure stdout/stderr handles UTF-8 gracefully without crashing on Windows codepages (cp1251, cp866)
+for _s in (sys.stdout, sys.stderr):
+    if _s is not None and hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
 PROXY_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(PROXY_DIR, "config.json")
 TOKEN_FILE = os.path.join(PROXY_DIR, ".vault_token")
@@ -122,26 +130,36 @@ def cmd_start(args):
         return
 
     python_exe = sys.executable
+    child_env = os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
+    child_env["PYTHONUTF8"] = "1"
+    child_env["PYTHONUNBUFFERED"] = "1"
 
     if foreground:
         print(f"{CYAN}{BOLD}Starting ZVault in foreground...{RESET}")
         try:
-            subprocess.run([python_exe, SERVER_PY], cwd=PROXY_DIR)
+            subprocess.run([python_exe, SERVER_PY], cwd=PROXY_DIR, env=child_env)
         except KeyboardInterrupt:
             print(f"\n{YELLOW}ZVault stopped.{RESET}")
     else:
         print(f"Starting {CYAN}{BOLD}ZVault{RESET} on {GREEN}{BASE_URL}{RESET}...", end=" ", flush=True)
 
+        if sys.platform == "win32":
+            w_exe = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
+            if os.path.exists(w_exe):
+                python_exe = w_exe
+
         log_f = open(LOG_FILE, "a", encoding="utf-8")
         if sys.platform == "win32":
-            creationflags = 0x08000000  # CREATE_NO_WINDOW
+            creationflags = 0x08000000 | 0x00000200  # CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP
             proc = subprocess.Popen(
                 [python_exe, SERVER_PY],
                 cwd=PROXY_DIR,
                 stdout=log_f,
                 stderr=log_f,
                 stdin=subprocess.DEVNULL,
-                creationflags=creationflags
+                creationflags=creationflags,
+                env=child_env
             )
             log_f.close()
             bg_pid = str(proc.pid)
@@ -154,7 +172,8 @@ def cmd_start(args):
                 stdout=log_f,
                 stderr=log_f,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True
+                start_new_session=True,
+                env=child_env
             )
             log_f.close()
             with open(PID_FILE, "w") as f:
