@@ -88,6 +88,16 @@ THINKING_BLOCK_KEYS = {
     "thinking", "data", "signature", "encrypted_content", "summary", "content"
 }
 
+# Exact words indicating sensitive credentials in compound identifiers
+SECRET_EXACT_WORDS = {
+    "key", "keys",
+    "secret", "secrets", "secretkey", "secretkeys",
+    "token", "tokens",
+    "password", "passwords", "passwd", "passphrase",
+    "credential", "credentials",
+    "apikey", "apikeys", "privatekey", "masterkey", "accesstoken"
+}
+
 
 def _is_valid_media_base64(val: Any) -> bool:
     """True if val looks like authentic base64 media payload (>=100 chars, standard base64 alphabet)."""
@@ -605,8 +615,8 @@ class SecretVault:
                     continue
                 if any(token.startswith(pfx) for pfx in ("call_", "toolu_", "chatcmpl-", "msg_", "resp_", "ft:", "gpt-", "claude-")):
                     continue
-                # Ignore pure hex strings of length 32, 40, 64 (MD5, Git SHA-1, SHA-256 / Webpack hashes)
-                if re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", token):
+                # Ignore pure hex strings (MD5, Git SHA-1, SHA-256, Mongo ObjectId, etc.)
+                if re.fullmatch(r"^[0-9a-fA-F]+$", token):
                     continue
                 # Ignore PascalCase / camelCase code identifiers composed of natural dictionary words
                 if any(c.isupper() for c in token):
@@ -616,23 +626,24 @@ class SecretVault:
                 # Inspect multi-segment tokens (separated by [_.-])
                 if any(sep in token for sep in ("_", "-", ".")):
                     segments = [s for s in re.split(r"[_\-\.]", token) if s]
-                    if len(segments) >= 3:
-                        word_segments = [s for s in segments if s.isalpha() and len(s) >= 3]
-                        non_word_segments = [s for s in segments if not (s.isalpha() and len(s) >= 3)]
+                    if len(segments) >= 2:
+                        word_segments = [s for s in segments if s.isalpha() and (s.islower() or s.isupper()) and 2 <= len(s) < 16]
+                        non_word_segments = [s for s in segments if s not in word_segments]
 
-                        # Check if token contains words explicitly indicating a secret/credential
-                        has_secret_marker = any(
-                            any(marker in w.lower() for marker in ("key", "secret", "token", "pass", "auth", "api", "credential"))
-                            for w in word_segments
-                        )
+                        # Exact word matches for secret/credential markers (prevents substring collisions like author, keyboard, compass, rapid)
+                        has_secret_marker = any(w.lower() in SECRET_EXACT_WORDS for w in word_segments)
 
                         # Check if any non-word segment looks like a high-entropy secret (e.g. random key suffix)
                         has_random_segment = False
+                        is_hex_without_marker = False
                         for s in non_word_segments:
                             if len(s) >= 16:
-                                # Skip pure hex hashes of standard lengths (Git commit SHA, MD5, SHA-256) ONLY if there is no secret keyword
-                                if not has_secret_marker and re.fullmatch(r"^[0-9a-fA-F]{32}$|^[0-9a-fA-F]{40}$|^[0-9a-fA-F]{64}$", s):
-                                    continue
+                                is_hex = bool(re.fullmatch(r"^[0-9a-fA-F]+$", s))
+                                # Hex segment without an explicit secret marker is ALWAYS an identifier/hash/trace-id, never a secret
+                                if is_hex and not has_secret_marker:
+                                    is_hex_without_marker = True
+                                    break
+
                                 has_letters_and_digits = any(c.isalpha() for c in s) and any(c.isdigit() for c in s)
                                 has_mixed_case = any(c.islower() for c in s) and any(c.isupper() for c in s)
                                 min_entropy = 2.85 if has_secret_marker else 3.5
@@ -640,8 +651,11 @@ class SecretVault:
                                     has_random_segment = True
                                     break
 
+                        if is_hex_without_marker:
+                            continue
+
                         if has_random_segment:
-                            # Token contains a high-entropy secret segment (e.g. live_secret_key_<random>)
+                            # Token contains a high-entropy secret segment (e.g. live_secret_key_<random>, prod_api_key_<hex>)
                             ph = self.register_secret(token, "ENTROPY_KEY", is_dynamic=True)
                             found.append((token, ph))
                             continue

@@ -1106,23 +1106,49 @@ service_token: MySecretToken99
 
         secret_token_32 = f"prod_api_key_{hex32}"
         secret_token_24 = f"prod_api_key_{hex24}"
+        app_secret_40 = f"app_secret_{hex40}"
+        auth_token_64 = f"auth_token_{hex64}"
+
         git_commit_sha = f"commit_sha_{hex40}"
         docker_build_hash = f"build_hash_{hex64}"
+        author_commit = f"author_commit_{hex40}"
+        keyboard_layout = f"keyboard_layout_{hex32}"
+        compass_build = f"compass_build_{hex40}"
+        rapid_cache = f"rapid_cache_entry_{hex24}"
+        api_trace = f"api_trace_id_{hex32}"
+        user_id = f"user_id_{hex24}"
+        request_span = f"request_span_{hex32[:16]}"
 
-        text = f"Config: key32={secret_token_32}, key24={secret_token_24}, commit={git_commit_sha}, build={docker_build_hash}"
+        text = (
+            f"Secrets: key32={secret_token_32}, key24={secret_token_24}, sec40={app_secret_40}, tok64={auth_token_64}\n"
+            f"Code IDs: commit={git_commit_sha}, build={docker_build_hash}, auth={author_commit}, "
+            f"kb={keyboard_layout}, compass={compass_build}, rapid={rapid_cache}, "
+            f"trace={api_trace}, uid={user_id}, span={request_span}"
+        )
         masked, count = vault.mask_text(text)
 
         # Hex secrets with explicit key/api prefix MUST be masked
         self.assertNotIn(secret_token_32, masked)
         self.assertNotIn(secret_token_24, masked)
-        # Git commit and build hash MUST NOT be masked
+        self.assertNotIn(app_secret_40, masked)
+        self.assertNotIn(auth_token_64, masked)
+
+        # Non-secret identifiers with substring words (author, keyboard, compass, rapid, trace, etc.) MUST NOT be masked
         self.assertIn(git_commit_sha, masked)
         self.assertIn(docker_build_hash, masked)
-        self.assertEqual(count, 2)
+        self.assertIn(author_commit, masked)
+        self.assertIn(keyboard_layout, masked)
+        self.assertIn(compass_build, masked)
+        self.assertIn(rapid_cache, masked)
+        self.assertIn(api_trace, masked)
+        self.assertIn(user_id, masked)
+        self.assertIn(request_span, masked)
+
+        self.assertEqual(count, 4)
 
         # Demask back to verify round-trip
         demasked, d_count = vault.demask_text(masked)
-        self.assertEqual(d_count, 2)
+        self.assertEqual(d_count, 4)
         self.assertEqual(demasked, text)
 
     # --- 47. Known secret (e.g. 'abc') does not suppress entropy detection of surrounding tokens ---
