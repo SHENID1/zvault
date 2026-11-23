@@ -104,9 +104,10 @@ def get_pid() -> Optional[int]:
             if sys.platform == "win32":
                 check = subprocess.run(
                     ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV"],
-                    capture_output=True, text=True
+                    capture_output=True
                 )
-                if str(pid) in check.stdout:
+                out = check.stdout.decode("utf-8", errors="replace")
+                if str(pid) in out:
                     return pid
             else:
                 try:
@@ -214,15 +215,17 @@ def cmd_stop():
     listening_pids = set()
     try:
         if sys.platform == "win32":
-            netstat = subprocess.run(["netstat", "-ano"], capture_output=True, text=True)
+            netstat = subprocess.run(["netstat", "-ano"], capture_output=True)
+            out = netstat.stdout.decode("utf-8", errors="replace")
             port_regex = re.compile(rf":{PORT}\s")
-            for line in netstat.stdout.splitlines():
+            for line in out.splitlines():
                 if port_regex.search(line) and "LISTENING" in line:
                     parts = line.strip().split()
                     listening_pids.add(parts[-1])
         else:
-            lsof = subprocess.run(["lsof", "-t", "-sTCP:LISTEN", f"-i:{PORT}"], capture_output=True, text=True)
-            for p in lsof.stdout.strip().splitlines():
+            lsof = subprocess.run(["lsof", "-t", "-sTCP:LISTEN", f"-i:{PORT}"], capture_output=True)
+            out = lsof.stdout.decode("utf-8", errors="replace")
+            for p in out.strip().splitlines():
                 if p.strip():
                     listening_pids.add(p.strip())
     except Exception:

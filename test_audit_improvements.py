@@ -1255,6 +1255,22 @@ service_token: MySecretToken99
         with patch("urllib.request.urlopen", return_value=zvault_resp):
             self.assertTrue(cli.is_running())
 
+    # --- 49. CLI subprocess calls handle Windows OEM codepages (CP866 / CP1251) without UnicodeDecodeError ---
+    def test_cli_get_pid_handles_cp866_oem_output(self):
+        from unittest.mock import patch, mock_open
+        from subprocess import CompletedProcess
+        import cli
+
+        # Simulated tasklist output in Russian CP866 (byte 0x88 is 'И' in CP866, invalid lead byte in UTF-8)
+        raw_cp866_tasklist = b'"\x88\xec\xff \xae\xa1\xe0\xa0\xa7\xa0","12345","Console","1","25 000 K"\r\n'
+
+        with patch("os.path.exists", return_value=True), \
+             patch("builtins.open", mock_open(read_data="12345")), \
+             patch("sys.platform", "win32"), \
+             patch("subprocess.run", return_value=CompletedProcess(args=[], returncode=0, stdout=raw_cp866_tasklist)):
+            pid = cli.get_pid()
+            self.assertEqual(pid, 12345)
+
 
 if __name__ == "__main__":
     unittest.main()
