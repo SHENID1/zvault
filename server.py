@@ -159,18 +159,38 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ZCode Secret Masking Proxy", version="1.1.1", lifespan=lifespan)
 
+LOG_FILE_PATH = os.path.join(os.path.dirname(__file__), "proxy.log")
+
+def _log_to_file(msg: str):
+    """Ensures logs always reach proxy.log even when running in console or without pipe redirection."""
+    try:
+        stdout_name = getattr(sys.stdout, "name", "")
+        if not stdout_name or os.path.abspath(stdout_name) != os.path.abspath(LOG_FILE_PATH):
+            with open(LOG_FILE_PATH, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+    except Exception:
+        pass
+
 
 def log_shield(msg: str):
-    print(f"{CYAN}{BOLD}[SHIELD]{RESET} {msg}")
+    line = f"{CYAN}{BOLD}[SHIELD]{RESET} {msg}"
+    print(line, flush=True)
+    _log_to_file(line)
 
 def log_mask(msg: str):
-    print(f"{YELLOW}{BOLD}[MASK]{RESET} {msg}")
+    line = f"{YELLOW}{BOLD}[MASK]{RESET} {msg}"
+    print(line, flush=True)
+    _log_to_file(line)
 
 def log_demask(msg: str):
-    print(f"{GREEN}{BOLD}[DEMASK]{RESET} {msg}")
+    line = f"{GREEN}{BOLD}[DEMASK]{RESET} {msg}"
+    print(line, flush=True)
+    _log_to_file(line)
 
 def log_warn(msg: str):
-    print(f"{RED}{BOLD}[WARN]{RESET} {msg}")
+    line = f"{RED}{BOLD}[WARN]{RESET} {msg}"
+    print(line, flush=True)
+    _log_to_file(line)
 
 
 @app.middleware("http")
